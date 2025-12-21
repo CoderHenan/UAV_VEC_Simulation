@@ -43,11 +43,13 @@ def run_experiment(algo_name):
                 print(f"  -> Found logs. Resuming from Ep {last_ep + 1}...")
                 start_ep = last_ep + 1
                 try:
-                    success = agent.load(model_dir)
-                    if not success:
-                        print("  -> Model load failed (files missing), training fresh.")
-                    else:
-                        print("  -> Model loaded successfully.")
+                    # 尝试加载已有模型
+                    if hasattr(agent, 'load'):
+                        success = agent.load(model_dir)
+                        if not success:
+                            print("  -> Model load failed (files missing), training fresh.")
+                        else:
+                            print("  -> Model loaded successfully.")
                 except Exception as e:
                     print(f"  -> Model load error: {e}, training fresh.")
         except Exception as e:
@@ -56,6 +58,7 @@ def run_experiment(algo_name):
             shutil.move(csv_path, backup_path)
             start_ep = 0
 
+    # 如果没有日志文件，初始化表头
     if not os.path.exists(csv_path):
         with open(csv_path, 'w') as f:
             f.write("ep,reward,delay,energy,succ\n")
@@ -63,35 +66,48 @@ def run_experiment(algo_name):
     for ep in range(start_ep, cfg.MAX_EPISODES):
         try:
             obs, _ = env.reset()
+            # 兼容不同算法的重置接口
             if hasattr(agent, 'reset_lstm'):
                 agent.reset_lstm()
+            if hasattr(agent, 'reset_stack'):
+                obs = agent.reset_stack(obs)
 
             ep_r, ep_delay, ep_energy, ep_succ = 0, 0, 0, 0
             actual_steps = 0
 
             for step in range(cfg.MAX_STEPS):
+                # 统一的动作选择接口
+                # 注意：ST-C-MASAC 返回5个值，其他算法也已适配返回 dummy 值
                 action, h_in, c_in, h_out, c_out = agent.select_action(obs, noise=False)
 
                 next_obs, next_g, rewards, done, info = env.step(action)
 
-                # --- [关键修复] 针对不同算法的存储与更新逻辑 ---
+                # ST-C-MASAC 需要堆叠 Frame
+                if hasattr(agent, 'stack_obs'):
+                    next_obs_processed = agent.stack_obs(next_obs)
+                else:
+                    next_obs_processed = next_obs
+
+                # --- 针对不同算法的存储与更新逻辑 ---
                 if algo_name == "Random":
-                    pass  # 随机算法不存储也不更新，直接跳过
+                    pass  # 随机算法跳过
 
                 elif algo_name == "Q-Learning":
-                    agent.update(obs, action, rewards, next_obs)
+                    # Q-Learning 是单步更新
+                    agent.update_step(obs, action, rewards, next_obs_processed)
 
                 elif algo_name == "AC":
-                    agent.update(obs, action, rewards, next_obs, done)
+                    # AC 是单步更新
+                    agent.update_step(obs, action, rewards, next_obs_processed, done)
 
                 else:
-                    # DDPG / ST-C-MASAC / DQN
-                    # 存入 Buffer
+                    # DDPG / ST-C-MASAC / DQN (Off-Policy)
+                    # 存入 Buffer，然后 update
                     if hasattr(agent, 'memory'):
-                        agent.memory.push(obs, action, rewards, next_obs, done, h_in, c_in, h_out, c_out)
+                        agent.memory.push(obs, action, rewards, next_obs_processed, done, h_in, c_in, h_out, c_out)
                         agent.update()
 
-                obs = next_obs
+                obs = next_obs_processed
                 ep_r += np.sum(rewards)
                 ep_delay += info['delay']
                 ep_energy += info['energy']
@@ -103,38 +119,45 @@ def run_experiment(algo_name):
             avg_delay = ep_delay / max(1, actual_steps)
             avg_energy = ep_energy / max(1, actual_steps)
 
+            # 追加写入日志
             log_str = f"{ep},{ep_r:.4f},{avg_delay:.4f},{avg_energy:.4f},{ep_succ}\n"
             with open(csv_path, 'a') as f:
                 f.write(log_str)
 
+            # 定期保存
             if ep % 20 == 0:
-                agent.save(model_dir)
+                if hasattr(agent, 'save'):
+                    agent.save(model_dir)
 
             if ep % 10 == 0:
                 print(f"{algo_name} Ep {ep}: R={ep_r:.1f} | D={avg_delay:.3f} | E={avg_energy:.1f} | Succ={ep_succ}")
 
         except KeyboardInterrupt:
             print("\n  -> Interrupted by user. Saving model...")
-            agent.save(model_dir)
+            if hasattr(agent, 'save'):
+                agent.save(model_dir)
             return
         except Exception as e:
             print(f"  -> Error in Ep {ep}: {e}")
             import traceback
             traceback.print_exc()
+            # 遇到错误尝试保存一下进度
+            if hasattr(agent, 'save'):
+                print("  -> Attempting emergency save...")
+                agent.save(model_dir)
             break
 
 
 if __name__ == "__main__":
-    # 如果想一次性跑完所有对比
+    # 在这里选择要运行的算法
     # algos = ["ST-C-MASAC", "DDPG", "AC", "DQN", "Q-Learning", "Random"]
-    # algos=["AC","Random","Q-Learning","DQN","ST-C-MASAC","DDPG"]
-    # 也可以只测试 Random
-    # algos = ["Random"]            # 已验证
-    # algos = ["DQN"]               #
-    # algos = ["DDPG"]              #
-    algos = ["ST-C-MASAC"]        # 已验证
-    # algos = ["AC"]                #
-    # algos = ["Q-Learning"]        # 已验证
+
+    # algos = ["ST-C-MASAC"]
+    # algos = ["DDPG"]
+    # algos = ["AC"]
+    # algos = ["DQN"]
+    # algos = ["Q-Learning"]
+    algos = ["Random"]
 
     for algo in algos:
         try:
@@ -142,11 +165,5 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"!! Critical Error running {algo}: {e}")
 
-    print("Generating plots...")
-    try:
-        from plot_results import plot_convergence, plot_latency_energy
-
-        plot_convergence()
-        plot_latency_energy()
-    except Exception as e:
-        print(f"Plotting failed: {e}")
+    # 纯净版：这里不再自动调用 plot_results.py
+    print("Done. To view results, please run 'python plot_results.py'.")

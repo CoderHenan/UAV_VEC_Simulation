@@ -3,6 +3,7 @@ import numpy as np
 import random
 from config import cfg
 
+
 class SumTree:
     def __init__(self, capacity):
         self.capacity = capacity
@@ -52,20 +53,17 @@ class SumTree:
 
 
 class PrioritizedReplayBuffer:
-    # [关键修复] 必须接收 capacity 和 alpha 参数
-    def __init__(self, capacity, alpha=0.6, beta=cfg.PER_BETA_START):
+    def __init__(self, capacity, alpha=0.6, beta=0.4):
         self.tree = SumTree(capacity)
+        self.capacity = capacity
         self.alpha = alpha
         self.beta = beta
-        self.capacity = capacity
         self.epsilon = 1e-6
 
     def push(self, state, action, reward, next_state, done, h_in, c_in, h_out, c_out):
         max_p = np.max(self.tree.tree[-self.tree.capacity:])
         if max_p == 0:
             max_p = 1.0
-
-        # 存储完整的 9 元组
         data = (state, action, reward, next_state, done, h_in, c_in, h_out, c_out)
         self.tree.add(max_p, data)
 
@@ -88,10 +86,9 @@ class PrioritizedReplayBuffer:
         is_weights = np.power(self.tree.count * sampling_probabilities, -self.beta)
         is_weights /= is_weights.max()
 
-        # [新增] 每次采样后自动增加beta，模拟退火（后期更加信任高优样本)
-        self.beta = min(1.0, self.beta + 1e-4)
+        # [修改] 使用 Config 中的步长参数
+        self.beta = min(1.0, self.beta + cfg.PER_BETA_INCREMENT)
 
-        # 解包 9 个元素
         states = np.array([x[0] for x in batch])
         actions = np.array([x[1] for x in batch])
         rewards = np.array([x[2] for x in batch])

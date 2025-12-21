@@ -14,71 +14,55 @@ def weights_init_(m):
 class AttentionComm(nn.Module):
     def __init__(self, hidden_dim, n_heads):
         super(AttentionComm, self).__init__()
-        # [修改] 应用 Config 中的 Dropout
-        self.mha = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=n_heads,
-            dropout=cfg.ATTN_DROPOUT,
-            batch_first=True
-        )
+        self.mha = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=n_heads, dropout=cfg.ATTN_DROPOUT,
+                                         batch_first=True)
 
     def forward(self, h_own, h_others):
         attn_out, _ = self.mha(query=h_own, key=h_others, value=h_others)
         return attn_out
 
 
+# Frame Stacking Actor
 class ST_Actor(nn.Module):
     def __init__(self, obs_dim, act_dim):
         super(ST_Actor, self).__init__()
+        # obs_dim 现在是 24 (8*3)
         self.fc1 = nn.Linear(obs_dim, cfg.HIDDEN_DIM)
 
-        # [恢复] LSTM 层
-        self.lstm = nn.LSTM(
-            input_size=cfg.HIDDEN_DIM,
-            hidden_size=cfg.LSTM_HIDDEN,
-            num_layers=cfg.LSTM_LAYERS,
-            batch_first=True
-        )
+        # 映射到特征空间
+        self.feature_map = nn.Linear(cfg.HIDDEN_DIM, cfg.LSTM_HIDDEN)
 
-        # Attention 层
+        # 空间协作
         self.comm = AttentionComm(hidden_dim=cfg.LSTM_HIDDEN, n_heads=cfg.ATTN_HEADS)
 
-        # 融合层
+        # 融合
         self.fc2 = nn.Linear(cfg.LSTM_HIDDEN * 2, cfg.HIDDEN_DIM)
-
         self.mu = nn.Linear(cfg.HIDDEN_DIM, act_dim)
         self.sigma = nn.Linear(cfg.HIDDEN_DIM, act_dim)
 
         self.apply(weights_init_)
 
-    def forward(self, obs, h_in, c_in, neighbor_h=None):
-        # 1. 特征提取
+    def forward(self, obs, neighbor_feats=None):
+        # 1. 基础特征
         x = F.relu(self.fc1(obs))
+        my_feat = F.relu(self.feature_map(x)).unsqueeze(1)
 
-        # 2. 时序记忆 (LSTM)
-        # h_in: (Layers, Batch, Hidden)
-        x_lstm, (h_out, c_out) = self.lstm(x, (h_in, c_in))
-
-        # 取最后一层的 hidden state 用于决策
-        curr_h = h_out[-1].unsqueeze(1)
-
-        # 3. 空间协作 (Attention)
-        if neighbor_h is not None and neighbor_h.size(1) > 0:
-            context = self.comm(curr_h, neighbor_h)
+        # 2. 空间协作
+        if neighbor_feats is not None:
+            context = self.comm(my_feat, neighbor_feats)
         else:
-            context = torch.zeros_like(curr_h)
+            context = torch.zeros_like(my_feat)
 
-        # 4. 融合决策
-        combined = torch.cat([curr_h, context], dim=-1).squeeze(1)
-        feat = F.relu(self.fc2(combined))
+        # 3. 决策
+        combined = torch.cat([my_feat, context], dim=-1).squeeze(1)
+        x2 = F.relu(self.fc2(combined))
 
-        mu = torch.tanh(self.mu(feat))
-        sigma = F.softplus(self.sigma(feat)) + 1e-6
-
-        # [关键] 返回更新后的 hidden states
-        return mu, sigma, (h_out, c_out)
+        mu = torch.tanh(self.mu(x2))
+        sigma = F.softplus(self.sigma(x2)) + 1e-6
+        return mu, sigma, my_feat.squeeze(1)
 
 
+# Critic (输入维度也变大了)
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Critic, self).__init__()
@@ -94,6 +78,7 @@ class Critic(nn.Module):
         return self.out(x)
 
 
+# DDPG/DQN 基准网络保持不变，它们会自动适配 OBS_DIM
 class BaselineActor(nn.Module):
     def __init__(self, obs_dim, act_dim):
         super(BaselineActor, self).__init__()
