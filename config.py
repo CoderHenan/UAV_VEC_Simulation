@@ -5,7 +5,7 @@ import os
 
 class Config:
     # --- 实验标识 ---
-    EXP_NAME = 'experiment_v13_final_check'
+    EXP_NAME = 'experiment_v14_checked'
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     RESULT_PATH = os.path.join(BASE_DIR, 'results', EXP_NAME)
     MODEL_PATH = os.path.join(BASE_DIR, 'models', EXP_NAME)
@@ -30,8 +30,9 @@ class Config:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     MAX_EPISODES = 2500
+    # MAX_EPISODES = 1000
     BATCH_SIZE = 512
-    UPDATES_PER_STEP = 2
+    UPDATES_PER_STEP = 1
 
     # [深度学习算法 LR]
     LR_ACTOR = 1e-4
@@ -77,6 +78,9 @@ class Config:
     R_TASK = 5.0
     W_DELAY = 2.0
     W_ENERGY = 0.008
+
+    REWARD_SCALE = 0.1
+    TARGET_ENTROPY_SCALE = 1.0
 
     def check_validity(self):
         print(f">> Config Check Passed. Device={self.DEVICE}, Batch={self.BATCH_SIZE}")
