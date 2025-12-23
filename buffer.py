@@ -64,6 +64,7 @@ class PrioritizedReplayBuffer:
         max_p = np.max(self.tree.tree[-self.tree.capacity:])
         if max_p == 0:
             max_p = 1.0
+        # [确认] 必须存储完整元组，包括占位符，否则 sample 时解包会乱
         data = (state, action, reward, next_state, done, h_in, c_in, h_out, c_out)
         self.tree.add(max_p, data)
 
@@ -73,6 +74,7 @@ class PrioritizedReplayBuffer:
         segment = self.tree.total() / batch_size
         priorities = []
 
+        # 采样逻辑
         for i in range(batch_size):
             a = segment * i
             b = segment * (i + 1)
@@ -82,19 +84,23 @@ class PrioritizedReplayBuffer:
             batch.append(data)
             idxs.append(idx)
 
-        sampling_probabilities = np.array(priorities) / self.tree.total()
+        # 计算 IS 权重
+        sampling_probabilities = np.array(priorities) / (self.tree.total() + 1e-6)
         is_weights = np.power(self.tree.count * sampling_probabilities, -self.beta)
-        is_weights /= is_weights.max()
+        is_weights /= (is_weights.max() + 1e-6)
 
-        # [修改] 使用 Config 中的步长参数
+        # [修改] 动态增加 Beta
         self.beta = min(1.0, self.beta + cfg.PER_BETA_INCREMENT)
 
+        # [修改] 显式解包所有字段，确保 numpy 数组维度正确
+        # 注意：这里假设 data 里的元素本身已经是 numpy array
         states = np.array([x[0] for x in batch])
         actions = np.array([x[1] for x in batch])
         rewards = np.array([x[2] for x in batch])
         next_states = np.array([x[3] for x in batch])
         dones = np.array([x[4] for x in batch])
 
+        # 即使 ST-C-MASAC 不用 hidden state，这里也得取出来，防止数据错位
         h_in = np.array([x[5] for x in batch])
         c_in = np.array([x[6] for x in batch])
         h_out = np.array([x[7] for x in batch])
