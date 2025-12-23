@@ -2,7 +2,6 @@
 import numpy as np
 import pandas as pd
 import os
-import shutil
 import time
 import torch
 from config import cfg
@@ -11,12 +10,12 @@ from agent import ST_MASAC_Agent, DDPG_Agent, DQN_Agent, QLearning_Agent, AC_Age
 
 
 def run_experiment(algo_name):
-    print(f"==================================================")
-    print(f"   🚀 STARTING EXPERIMENT: {algo_name}")
-    print(f"   📂 Exp Name: {cfg.EXP_NAME}")
-    print(f"==================================================")
+    print(f"\n{'=' * 60}")
+    print(f"🚀 启动实验: {algo_name}")
+    print(f"📂 实验目录: {cfg.EXP_NAME}")
+    print(f"{'=' * 60}")
 
-    # 1. 初始化环境与智能体
+    # 1. 初始化环境
     env = UAVEnv()
 
     agents_map = {
@@ -28,119 +27,119 @@ def run_experiment(algo_name):
         "Random": Random_Agent
     }
 
-    agent_cls = agents_map.get(algo_name)
-    if agent_cls is None:
-        print(f"!! Error: Agent {algo_name} not implemented.")
+    if algo_name not in agents_map:
+        print(f"!! 错误: 未实现的算法 {algo_name}")
         return
-    agent = agent_cls()
 
-    # 2. 路径设置
+    agent = agents_map[algo_name]()
+
+    # [检查点] 打印当前算法是否使用了 Frame Stack
+    # 这是区分 v16 主角与配角的关键标志
+    use_stack = hasattr(agent, 'stack_obs')
+    obs_dim_used = cfg.OBS_DIM if use_stack else cfg.RAW_OBS_DIM
+
+    print(f"ℹ️  算法配置检查:")
+    print(f"   - Frame Stack: {'✅ ENABLED (24-dim)' if use_stack else '❌ DISABLED (8-dim Baseline)'}")
+    print(f"   - Obs Dim: {obs_dim_used}")
+    print(f"   - Device: {cfg.DEVICE}")
+    print(f"{'-' * 60}\n")
+
+    # 2. 路径与恢复
     os.makedirs(cfg.RESULT_PATH, exist_ok=True)
     model_dir = os.path.join(cfg.MODEL_PATH, algo_name)
     os.makedirs(model_dir, exist_ok=True)
     csv_path = os.path.join(cfg.RESULT_PATH, f"{algo_name}_metrics.csv")
 
-    # 3. 断点续训逻辑 (Smart Resume)
     start_ep = 0
-
-    # [修改] 优先尝试加载完整的 Checkpoint (包含优化器状态)
+    # [修正] 优先调用完整状态加载
     if hasattr(agent, 'load_ckpt'):
-        loaded_ep = agent.load_ckpt(model_dir)
-        if loaded_ep > 0:
-            start_ep = loaded_ep
-            print(f"✅ Resumed training from Checkpoint: Episode {start_ep}")
-
-    # 兼容旧版加载逻辑
-    elif hasattr(agent, 'load') and os.path.exists(csv_path):
+        start_ep = agent.load_ckpt(model_dir)
+        if start_ep > 0: print(f"✅ 断点续训: 从 Ep {start_ep} 开始")
+    elif hasattr(agent, 'load') and os.path.exists(csv_path):  # 兼容旧版逻辑
         try:
-            df_hist = pd.read_csv(csv_path)
-            if not df_hist.empty and agent.load(model_dir):
-                start_ep = int(df_hist.iloc[-1, 0]) + 1
-                print(f"⚠️ Resumed using Legacy Load (Weights Only) from Episode {start_ep}")
+            df = pd.read_csv(csv_path)
+            if not df.empty and agent.load(model_dir):
+                start_ep = int(df.iloc[-1, 0]) + 1
         except:
             pass
 
-    # 初始化 CSV
+    # 初始化 CSV 表头
     if start_ep == 0 or not os.path.exists(csv_path):
         with open(csv_path, 'w') as f:
             f.write("ep,reward,delay,energy,succ\n")
 
-    # 4. 主训练循环
+    # 3. 训练循环
     for ep in range(start_ep, cfg.MAX_EPISODES):
         try:
             st_time = time.time()
-            obs, _ = env.reset()
+            raw_obs, _ = env.reset()
 
-            # [特有] 重置 Frame Stack
-            if hasattr(agent, 'reset_stack'):
-                obs = agent.reset_stack(obs)
+            # [关键分流] 只有 ST-C-MASAC 会在这里初始化 Stack
+            if use_stack:
+                curr_state = agent.reset_stack(raw_obs)
+            else:
+                curr_state = raw_obs  # DDPG/DQN 直接用原始观测
 
             ep_r, ep_delay, ep_energy, ep_succ = 0, 0, 0, 0
-            actual_steps = 0
+            steps = 0
 
             for step in range(cfg.MAX_STEPS):
-                # 选择动作
-                action, h_in, c_in, h_out, c_out = agent.select_action(obs, noise=True)
+                # 动作选择 (Training mode: noise=True)
+                # 注意：agent.py 中所有算法的 select_action 接口已对齐，返回5个值
+                action, h_in, c_in, h_out, c_out = agent.select_action(curr_state, noise=True)
 
-                next_obs, next_g, rewards, done, info = env.step(action)
+                next_raw_obs, _, rewards, done, info = env.step(action)
 
-                # 堆叠观测
-                if hasattr(agent, 'stack_obs'):
-                    next_obs_processed = agent.stack_obs(next_obs)
+                # [关键分流] 状态转换
+                if use_stack:
+                    next_state = agent.stack_obs(next_raw_obs)
                 else:
-                    next_obs_processed = next_obs
+                    next_state = next_raw_obs
 
-                # 算法更新
+                # 存储与更新
                 if algo_name in ["Random"]:
                     pass
-                elif algo_name in ["Q-Learning", "AC"]:
-                    agent.update_step(obs, action, rewards, next_obs_processed, done)
-                else:
-                    # Off-Policy (DDPG, DQN, ST-C-MASAC)
-                    if hasattr(agent, 'memory'):
-                        agent.memory.push(obs, action, rewards, next_obs_processed, done, h_in, c_in, h_out, c_out)
-                        agent.update()
+                elif hasattr(agent, 'memory'):  # Off-Policy (DDPG, DQN, MASAC)
+                    agent.memory.push(curr_state, action, rewards, next_state, done, h_in, c_in, h_out, c_out)
+                    agent.update()
+                elif hasattr(agent, 'update_step'):  # On-Policy / Tabular (AC, QL)
+                    agent.update_step(curr_state, action, rewards, next_state, done)
 
-                obs = next_obs_processed
+                curr_state = next_state
                 ep_r += np.sum(rewards)
                 ep_delay += info['delay']
                 ep_energy += info['energy']
                 ep_succ += info['succ']
-                actual_steps += 1
+                steps += 1
 
                 if np.all(done): break
 
-            # [修改] Episode 结束，更新学习率 (Scheduler Step)
+            # [修正] Episode 结束，更新学习率 (仅支持 Scheduler 的 Agent 有此方法)
             if hasattr(agent, 'update_lr'):
                 agent.update_lr()
 
-            # 统计与记录
-            avg_delay = ep_delay / max(1, actual_steps)
-            avg_energy = ep_energy / max(1, actual_steps)
-            fps = actual_steps / (time.time() - st_time)
+            # 记录
+            avg_delay = ep_delay / max(1, steps)
+            avg_energy = ep_energy / max(1, steps)
+            fps = int(steps / (time.time() - st_time))
 
-            log_str = f"{ep},{ep_r:.4f},{avg_delay:.4f},{avg_energy:.4f},{ep_succ}\n"
             with open(csv_path, 'a') as f:
-                f.write(log_str)
+                f.write(f"{ep},{ep_r:.4f},{avg_delay:.4f},{avg_energy:.4f},{ep_succ}\n")
 
-            # [修改] 日志输出：增加 LR 和 Q 值监控
+            # 打印日志
             if ep % 10 == 0:
-                # 获取当前学习率
-                curr_lr = 0.0
-                if hasattr(agent, 'actor_opts') and agent.actor_opts:
+                lr_str = ""
+                # 获取 LR 用于监控
+                if hasattr(agent, 'actor_opts') and len(agent.actor_opts) > 0:
                     curr_lr = agent.actor_opts[0].param_groups[0]['lr']
+                    lr_str = f"| LR: {curr_lr:.2e}"
+                elif hasattr(agent, 'opts') and len(agent.opts) > 0:  # DQN
+                    curr_lr = agent.opts[0].param_groups[0]['lr']
+                    lr_str = f"| LR: {curr_lr:.2e}"
 
-                msg = f"Ep {ep:<4} | R: {ep_r:>7.1f} | D: {avg_delay:>5.3f} | Succ: {ep_succ:>2} | FPS: {int(fps)}"
+                print(f"Ep {ep:<4} | R: {ep_r:>7.1f} | D: {avg_delay:>5.3f} | Succ: {ep_succ:>2} | FPS: {fps} {lr_str}")
 
-                # 获取 SAC 内部诊断信息
-                if hasattr(agent, 'log_alpha'):  # 简单判断是否是 SAC 类
-                    # 尝试读取内部变量 (假设 agent 存了这些临时变量，如果没有也没关系)
-                    # 更好的方式是 agent.update() 返回 info，但为了不改动太大，这里只打印 LR
-                    msg += f" | LR: {curr_lr:.2e}"
-
-                print(msg)
-
-            # [修改] 定期保存 Checkpoint
+            # [修正] 定期保存完整 Checkpoint
             if ep % 20 == 0:
                 if hasattr(agent, 'save_ckpt'):
                     agent.save_ckpt(model_dir, ep)
@@ -148,27 +147,23 @@ def run_experiment(algo_name):
                     agent.save(model_dir)
 
         except KeyboardInterrupt:
-            print("\n🛑 Training interrupted. Saving checkpoint...")
-            if hasattr(agent, 'save_ckpt'):
-                agent.save_ckpt(model_dir, ep)
+            print("\n🛑 训练被用户中断，正在保存当前状态...")
+            if hasattr(agent, 'save_ckpt'): agent.save_ckpt(model_dir, ep)
             return
         except Exception as e:
-            print(f"\n❌ Error in Episode {ep}: {e}")
+            print(f"❌ 训练发生严重错误: {e}")
             import traceback
             traceback.print_exc()
-            if hasattr(agent, 'save_ckpt'):
-                agent.save_ckpt(model_dir, ep)
             break
 
-    print(f"\n✅ Experiment Finished: {algo_name}")
+    print(f"✅ 实验结束: {algo_name}")
 
 
 if __name__ == "__main__":
-    # algos = ["ST-C-MASAC", "DDPG"]
-    # algos = ["ST-C-MASAC"]
-    # algos = ["ST-C-MASAC"]
-    algos = ["DDPG"]
-    # algos = ["Q-Learning"]    # 已测试
-    # algos = ["Random"]        # 已测试
-    for algo in algos:
-        run_experiment(algo)
+    # --- 实验入口 ---
+    # 1. 先跑主角 (验证是否开启了 Frame Stack)
+    # run_experiment("ST-C-MASAC")
+
+    # 2. 再跑配角 (验证是否禁用了 Frame Stack)
+    # run_experiment("DDPG")
+    run_experiment("Random")
