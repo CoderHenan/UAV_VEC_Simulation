@@ -114,11 +114,24 @@ def run_experiment(algo_name):
 
                 if np.all(done): break
 
-            # [修正] Episode 结束，更新学习率 (仅支持 Scheduler 的 Agent 有此方法)
+            # ------------------------------------------------------
+            # [修正后的逻辑] 只有在正式训练开始后，才更新学习率
+            # ------------------------------------------------------
+            # 判断标准：只有当经验池数据足够，agent.update() 才会真正执行 optimizer.step()
+            # 此时调用 scheduler.step() 才是合法的
             if hasattr(agent, 'update_lr'):
-                agent.update_lr()
+                if hasattr(agent, 'memory'):
+                    # 对于 Off-Policy 算法 (ST-C-MASAC, DDPG, DQN)
+                    if len(agent.memory) >= cfg.BATCH_SIZE:
+                        agent.update_lr()
+                else:
+                    # 对于 On-Policy / Tabular (AC, Q-Learning)，没有 Replay Buffer
+                    # 它们从第一步就开始更新，所以直接调用
+                    agent.update_lr()
 
-            # 记录
+            # ------------------------------------------------------
+            # 统计与记录
+            # ------------------------------------------------------
             avg_delay = ep_delay / max(1, steps)
             avg_energy = ep_energy / max(1, steps)
             fps = int(steps / (time.time() - st_time))
@@ -138,7 +151,6 @@ def run_experiment(algo_name):
                     lr_str = f"| LR: {curr_lr:.2e}"
 
                 print(f"Ep {ep:<4} | R: {ep_r:>7.1f} | D: {avg_delay:>5.3f} | Succ: {ep_succ:>2} | FPS: {fps} {lr_str}")
-
             # [修正] 定期保存完整 Checkpoint
             if ep % 20 == 0:
                 if hasattr(agent, 'save_ckpt'):
@@ -166,4 +178,9 @@ if __name__ == "__main__":
 
     # 2. 再跑配角 (验证是否禁用了 Frame Stack)
     # run_experiment("DDPG")
-    run_experiment("Random")
+    # run_experiment("Random")
+    # run_experiment("Q-Learning")
+    # run_experiment("DQN")
+    # run_experiment("DDPG")
+    # run_experiment("AC")
+    run_experiment("ST-C-MASAC")

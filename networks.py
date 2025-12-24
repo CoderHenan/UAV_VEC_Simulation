@@ -2,102 +2,131 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from config import cfg
 
 
 def weights_init_(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
-        torch.nn.init.constant_(m.bias, 0)
+        if m.bias is not None:
+            torch.nn.init.constant_(m.bias, 0)
 
 
-class AttentionComm(nn.Module):
-    def __init__(self, hidden_dim, n_heads):
-        super(AttentionComm, self).__init__()
-        self.mha = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=n_heads, dropout=cfg.ATTN_DROPOUT,
-                                         batch_first=True)
+# 1. 多头注意力机制 (空间协作)
+class MultiHeadAttention(nn.Module):
+    def __init__(self, input_dim, num_heads=cfg.ATTN_HEADS):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.head_dim = input_dim // num_heads
+        assert self.head_dim * num_heads == input_dim, "Embed dim error"
 
-    def forward(self, h_own, h_others):
-        attn_out, _ = self.mha(query=h_own, key=h_others, value=h_others)
-        return attn_out
+        self.W_Q = nn.Linear(input_dim, input_dim)
+        self.W_K = nn.Linear(input_dim, input_dim)
+        self.W_V = nn.Linear(input_dim, input_dim)
+        self.out_proj = nn.Linear(input_dim, input_dim)
+
+    def forward(self, query, values):
+        batch_size = query.size(0)
+        Q = self.W_Q(query).unsqueeze(1)
+        K = self.W_K(values)
+        V = self.W_V(values)
+
+        Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.head_dim)
+        attn_weights = F.softmax(scores, dim=-1)
+        context = torch.matmul(attn_weights, V)
+        context = context.transpose(1, 2).contiguous().view(batch_size, 1, -1)
+
+        return self.out_proj(context.squeeze(1))
 
 
-# Frame Stacking Actor
+# 2. ST_Actor (主角网络 - 无LSTM)
 class ST_Actor(nn.Module):
     def __init__(self, obs_dim, act_dim):
         super(ST_Actor, self).__init__()
-        # obs_dim 现在是 24 (8*3)
+
+        # [第一层] 处理堆叠后的 24维 输入
         self.fc1 = nn.Linear(obs_dim, cfg.HIDDEN_DIM)
 
-        # 映射到特征空间
-        self.feature_map = nn.Linear(cfg.HIDDEN_DIM, cfg.LSTM_HIDDEN)
+        # [第二层] 特征映射 (这里之前变量名写错了，现在修正为 HIDDEN_DIM_2)
+        # 这是一个普通的全连接层，将特征压缩到 128 维，供 Attention 使用
+        self.feature_map = nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM_2)
 
-        # 空间协作
-        self.comm = AttentionComm(hidden_dim=cfg.LSTM_HIDDEN, n_heads=cfg.ATTN_HEADS)
+        # [空间协作]
+        self.attn = MultiHeadAttention(cfg.HIDDEN_DIM_2)
 
-        # 融合
-        self.fc2 = nn.Linear(cfg.LSTM_HIDDEN * 2, cfg.HIDDEN_DIM)
-        self.mu = nn.Linear(cfg.HIDDEN_DIM, act_dim)
-        self.sigma = nn.Linear(cfg.HIDDEN_DIM, act_dim)
+        # [输出层]
+        self.mean_layer = nn.Linear(cfg.HIDDEN_DIM_2 * 2, act_dim)
+        self.log_std_layer = nn.Linear(cfg.HIDDEN_DIM_2 * 2, act_dim)
 
         self.apply(weights_init_)
 
     def forward(self, obs, neighbor_feats=None):
-        # 1. 基础特征
+        # 1. 基础特征提取 (MLP)
         x = F.relu(self.fc1(obs))
-        my_feat = F.relu(self.feature_map(x)).unsqueeze(1)
+        my_feat = F.relu(self.feature_map(x))  # (Batch, 128)
 
-        # 2. 空间协作
+        # 2. 空间交互 (Attention)
         if neighbor_feats is not None:
-            context = self.comm(my_feat, neighbor_feats)
+            context = self.attn(my_feat, neighbor_feats)
         else:
             context = torch.zeros_like(my_feat)
 
-        # 3. 决策
-        combined = torch.cat([my_feat, context], dim=-1).squeeze(1)
-        x2 = F.relu(self.fc2(combined))
+        # 3. 拼接决策
+        combined = torch.cat([my_feat, context], dim=1)
 
-        mu = torch.tanh(self.mu(x2))
-        sigma = F.softplus(self.sigma(x2)) + 1e-6
-        return mu, sigma, my_feat.squeeze(1)
+        mean = self.mean_layer(combined)
+        log_std = self.log_std_layer(combined)
+        log_std = torch.clamp(log_std, min=-20, max=2)
+
+        return mean, log_std.exp(), my_feat
 
 
-# Critic (输入维度也变大了)
+# 3. Critic (通用)
 class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, global_obs_dim, global_act_dim):
         super(Critic, self).__init__()
-        self.fc1 = nn.Linear(state_dim + action_dim, cfg.HIDDEN_DIM)
-        self.fc2 = nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM_2)
-        self.out = nn.Linear(cfg.HIDDEN_DIM_2, 1)
+        self.l1 = nn.Linear(global_obs_dim + global_act_dim, cfg.HIDDEN_DIM)
+        self.l2 = nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM_2)
+        self.l3 = nn.Linear(cfg.HIDDEN_DIM_2, 1)
         self.apply(weights_init_)
 
     def forward(self, state, action):
-        x = torch.cat([state, action], dim=1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.out(x)
+        xu = torch.cat([state, action], 1)
+        x = F.relu(self.l1(xu))
+        x = F.relu(self.l2(x))
+        return self.l3(x)
 
 
-# DDPG/DQN 基准网络保持不变，它们会自动适配 OBS_DIM
+# 4. Baseline Actor (DDPG用)
 class BaselineActor(nn.Module):
     def __init__(self, obs_dim, act_dim):
         super(BaselineActor, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, cfg.HIDDEN_DIM), nn.ReLU(),
-            nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM), nn.ReLU(),
-            nn.Linear(cfg.HIDDEN_DIM, act_dim), nn.Tanh()
-        )
+        self.l1 = nn.Linear(obs_dim, cfg.HIDDEN_DIM)
+        self.l2 = nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM_2)
+        self.l3 = nn.Linear(cfg.HIDDEN_DIM_2, act_dim)
+        self.apply(weights_init_)
 
-    def forward(self, x): return self.net(x)
+    def forward(self, state):
+        x = F.relu(self.l1(state))
+        x = F.relu(self.l2(x))
+        return torch.tanh(self.l3(x))
 
 
+# 5. DQN Net
 class DQN_Net(nn.Module):
-    def __init__(self, obs_dim, n_actions):
+    def __init__(self, obs_dim, num_actions):
         super(DQN_Net, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, cfg.HIDDEN_DIM), nn.ReLU(),
-            nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM), nn.ReLU(),
-            nn.Linear(cfg.HIDDEN_DIM, n_actions)
-        )
+        self.l1 = nn.Linear(obs_dim, cfg.HIDDEN_DIM)
+        self.l2 = nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM_2)
+        self.l3 = nn.Linear(cfg.HIDDEN_DIM_2, num_actions)
+        self.apply(weights_init_)
 
-    def forward(self, x): return self.net(x)
+    def forward(self, state):
+        x = F.relu(self.l1(state))
+        x = F.relu(self.l2(x))
+        return self.l3(x)

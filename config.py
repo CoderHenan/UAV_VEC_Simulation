@@ -4,7 +4,8 @@ import os
 
 class Config:
     # --- 实验标识 ---
-    EXP_NAME = 'Exp_v16_Strict_Baseline' # 修正版本号
+    # EXP_NAME = 'Exp_v16_Strict_Baseline' # 修正版本号
+    EXP_NAME = 'experiment_fix_baseline_v16' # 修正版本号
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     RESULT_PATH = os.path.join(BASE_DIR, 'results', EXP_NAME)
     MODEL_PATH = os.path.join(BASE_DIR, 'models', EXP_NAME)
@@ -49,6 +50,9 @@ class Config:
     HIDDEN_DIM = 256
     HIDDEN_DIM_2 = 128
     ATTN_HEADS = 4
+
+    # [兼容旧代码参数] 如果不修改 networks.py，加上这一行也能跑，但建议用新 networks.py
+    LSTM_HIDDEN = 128
 
     # --- 经验回放 ---
     PER_CAPACITY = 100000

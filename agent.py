@@ -242,7 +242,12 @@ class ST_MASAC_Agent:
             self.memory.update_priorities(idxs, td_errors.detach().cpu().numpy().flatten())
 
     def update_lr(self):
-        for sch in self.actor_schedulers: sch.step()
+        """
+        [职责修正] 仅负责更新学习率，不包含任何状态检查逻辑。
+        调用时机由外部 (main.py) 控制。
+        """
+        for sch in self.actor_schedulers:
+            sch.step()
         self.critic_scheduler.step()
         self.alpha_scheduler.step()
 
