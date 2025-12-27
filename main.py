@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import time
 import torch
+import random
 from config import cfg
 from env_core import UAVEnv
 from agent import ST_MASAC_Agent, DDPG_Agent, DQN_Agent, QLearning_Agent, AC_Agent, Random_Agent
@@ -170,17 +171,29 @@ def run_experiment(algo_name):
 
     print(f"✅ 实验结束: {algo_name}")
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
 
 if __name__ == "__main__":
+
+    SEED=10
+    set_seed(SEED)
+
     # --- 实验入口 ---
     # 1. 先跑主角 (验证是否开启了 Frame Stack)
     # run_experiment("ST-C-MASAC")
-
     # 2. 再跑配角 (验证是否禁用了 Frame Stack)
-    # run_experiment("DDPG")
-    # run_experiment("Random")
-    # run_experiment("Q-Learning")
-    # run_experiment("DQN")
-    # run_experiment("DDPG")
-    # run_experiment("AC")
-    run_experiment("ST-C-MASAC")
+    run_experiment("Random")        # 已验证
+    run_experiment("AC")            # 已验证
+    run_experiment("Q-Learning")    # 已验证
+    run_experiment("ST-C-MASAC")  # 已验证
+    run_experiment("DQN")           # 已验证
+    run_experiment("DDPG")

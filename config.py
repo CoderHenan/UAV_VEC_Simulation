@@ -5,7 +5,10 @@ import os
 class Config:
     # --- 实验标识 ---
     # EXP_NAME = 'Exp_v16_Strict_Baseline' # 修正版本号
-    EXP_NAME = 'experiment_fix_baseline_v16' # 修正版本号
+    # EXP_NAME = 'experiment_fix_baseline_v16' # 修正版本号
+    # EXP_NAME = 'Formulation_experiment_latest' # 修正版本号
+    # EXP_NAME = 'test_experiment' # 修正版本号
+    EXP_NAME = 'SEED_10' # 修正版本号
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     RESULT_PATH = os.path.join(BASE_DIR, 'results', EXP_NAME)
     MODEL_PATH = os.path.join(BASE_DIR, 'models', EXP_NAME)
@@ -30,7 +33,7 @@ class Config:
 
     # --- 训练参数 ---
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    MAX_EPISODES = 1200
+    MAX_EPISODES = 2000
     BATCH_SIZE = 512
     UPDATES_PER_STEP = 1
 
