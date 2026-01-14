@@ -6,13 +6,13 @@ import numpy as np
 import os
 import pickle
 import glob
+import pandas as pd
 from collections import deque
-from networks import ST_Actor, Critic, BaselineActor, DQN_Net, ValueNetwork, GaussianActor
+from networks import ST_Actor, Critic, BaselineActor, DoubleDQN_Net, ValueNetwork, GaussianActor
 from buffer import PrioritizedReplayBuffer
 from config import cfg
 
 
-# --- 动作离散化工具 (DQN / Q-Learning 专用) ---
 class ActionDiscretizer:
     def __init__(self):
         self.speeds = [-1.0, 0.0, 1.0]
@@ -33,7 +33,6 @@ class ActionDiscretizer:
         return np.argmin(np.linalg.norm(self.action_matrix - act_vector, axis=1))
 
 
-# --- 帧堆叠器 (ST-C-MASAC 独占) ---
 class FrameStacker:
     def __init__(self, n_uav, k=cfg.N_FRAMES):
         self.n_uav = n_uav
@@ -57,20 +56,87 @@ class FrameStacker:
         return np.array(stacked_obs)
 
 
-# ==========================================
-# 1. ST-C-MASAC (Ours)
-# ==========================================
-class ST_MASAC_Agent:
+# ================= Base Agent =================
+class BaseAgent:
     def __init__(self):
         self.device = cfg.DEVICE
-        self.stacker = FrameStacker(cfg.N_UAV)
+        self.model_dict = {}
 
-        # Networks (使用 OBS_DIM = 24)
+    def save_ckpt(self, path, episode):
+        os.makedirs(path, exist_ok=True)
+        checkpoint = {'episode': episode}
+        for name, model in self.model_dict.items():
+            if isinstance(model, torch.Tensor):
+                checkpoint[name] = model
+            elif isinstance(model, list):
+                checkpoint[name] = [m.state_dict() for m in model]
+            else:
+                checkpoint[name] = model.state_dict()
+
+        torch.save(checkpoint, os.path.join(path, f"checkpoint_ep_{episode}.pth"))
+        files = sorted(glob.glob(os.path.join(path, "checkpoint_ep_*.pth")), key=os.path.getmtime)
+        while len(files) > 5:
+            try:
+                os.remove(files[0])
+            except:
+                pass
+            files.pop(0)
+
+    def load_ckpt(self, model_path, csv_path=None):
+        files = sorted(glob.glob(os.path.join(model_path, "checkpoint_ep_*.pth")), key=os.path.getmtime)
+        if not files: return 0
+        latest = files[-1]
+        print(f">> Loading checkpoint: {latest}")
+        try:
+            ckpt = torch.load(latest, map_location=self.device)
+            start_ep = ckpt['episode'] + 1
+            for name, model in self.model_dict.items():
+                if name not in ckpt: continue
+                try:
+                    if isinstance(model, torch.Tensor):
+                        with torch.no_grad():
+                            model.copy_(ckpt[name])
+                    elif isinstance(model, list):
+                        for i, m in enumerate(model): m.load_state_dict(ckpt[name][i])
+                    else:
+                        model.load_state_dict(ckpt[name])
+                except Exception as e:
+                    print(f"Error loading {name}: {e}")
+
+            if csv_path and os.path.exists(csv_path):
+                try:
+                    df = pd.read_csv(csv_path)
+                    if not df.empty and df['ep'].max() >= start_ep:
+                        df = df[df['ep'] < start_ep]
+                        df.to_csv(csv_path, index=False)
+                except:
+                    pass
+            return start_ep
+        except Exception as e:
+            print(f"Load Error: {e}")
+            return 0
+
+    def update_lr(self):
+        if hasattr(self, 'schedulers'):
+            for sch in self.schedulers: sch.step()
+
+    def select_action(self, obs, noise=False):
+        raise NotImplementedError
+
+    def update(self, transition):
+        raise NotImplementedError
+
+
+# ================= ST-C-MASAC =================
+class ST_MASAC_Agent(BaseAgent):
+    def __init__(self):
+        super().__init__()
+        self.stacker = FrameStacker(cfg.N_UAV)
+        # Ours 使用堆叠帧维度
         self.actors = [ST_Actor(cfg.OBS_DIM, cfg.ACT_DIM).to(self.device) for _ in range(cfg.N_UAV)]
 
         global_obs = cfg.N_UAV * cfg.OBS_DIM
         global_act = cfg.N_UAV * cfg.ACT_DIM
-
         self.critic1 = Critic(global_obs, global_act).to(self.device)
         self.critic2 = Critic(global_obs, global_act).to(self.device)
         self.target_c1 = Critic(global_obs, global_act).to(self.device)
@@ -78,26 +144,29 @@ class ST_MASAC_Agent:
         self.target_c1.load_state_dict(self.critic1.state_dict())
         self.target_c2.load_state_dict(self.critic2.state_dict())
 
-        # Optimizers
         self.actor_opts = [torch.optim.Adam(a.parameters(), lr=cfg.LR_ACTOR) for a in self.actors]
         self.critic_opt = torch.optim.Adam(list(self.critic1.parameters()) + list(self.critic2.parameters()),
                                            lr=cfg.LR_CRITIC)
 
-        # Entropy Tuning
         self.target_entropy = -float(cfg.ACT_DIM * cfg.N_UAV)
         self.log_alpha = torch.tensor([np.log(cfg.ALPHA_START)], requires_grad=True, device=self.device)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=cfg.LR_ACTOR)
-
-        # Memory
         self.memory = PrioritizedReplayBuffer(cfg.PER_CAPACITY, alpha=cfg.PER_ALPHA, beta=cfg.PER_BETA_START)
 
-        # Schedulers
-        self.actor_schedulers = [torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.MAX_EPISODES, eta_min=1e-6)
-                                 for opt in self.actor_opts]
-        self.critic_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.critic_opt, T_max=cfg.MAX_EPISODES,
-                                                                           eta_min=1e-6)
-        self.alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.alpha_opt, T_max=cfg.MAX_EPISODES,
-                                                                          eta_min=1e-6)
+        self.actor_schedulers = [
+            torch.optim.lr_scheduler.StepLR(opt, step_size=cfg.LR_DECAY_STEP, gamma=cfg.LR_DECAY_GAMMA) for opt in
+            self.actor_opts]
+        self.critic_scheduler = torch.optim.lr_scheduler.StepLR(self.critic_opt, step_size=cfg.LR_DECAY_STEP,
+                                                                gamma=cfg.LR_DECAY_GAMMA)
+        self.alpha_scheduler = torch.optim.lr_scheduler.StepLR(self.alpha_opt, step_size=cfg.LR_DECAY_STEP,
+                                                               gamma=cfg.LR_DECAY_GAMMA)
+        self.schedulers = self.actor_schedulers + [self.critic_scheduler, self.alpha_scheduler]
+
+        self.model_dict = {
+            'actors': self.actors, 'critic1': self.critic1, 'critic2': self.critic2,
+            'target_c1': self.target_c1, 'target_c2': self.target_c2, 'log_alpha': self.log_alpha,
+            'actor_opts': self.actor_opts, 'critic_opt': self.critic_opt, 'alpha_opt': self.alpha_opt
+        }
 
     def reset_stack(self, obs):
         return self.stacker.reset(obs)
@@ -106,35 +175,39 @@ class ST_MASAC_Agent:
         return self.stacker.step(obs)
 
     def select_action(self, obs_list, noise=False):
-        actions = []
-        feats_cpu = []
+        obs_tensor = torch.as_tensor(obs_list, dtype=torch.float32, device=self.device)
+        curr_feats_list = []
         with torch.no_grad():
-            curr_feats = []
             for i, actor in enumerate(self.actors):
-                o = torch.FloatTensor(obs_list[i]).view(1, -1).to(self.device)
-                x = F.relu(actor.fc1(o))
-                f = F.relu(actor.feature_map(x))
-                curr_feats.append(f)
+                f = actor.extract_feat(obs_tensor[i:i + 1])
+                curr_feats_list.append(f)
+            all_feats = torch.cat(curr_feats_list, dim=0)
 
+            N = cfg.N_UAV
+            mask = ~torch.eye(N, dtype=torch.bool, device=self.device)
+            all_feats_expanded = all_feats.unsqueeze(0).expand(N, N, -1)
+            neigh_feats_batch = all_feats_expanded[mask].view(N, N - 1, -1)
+
+            actions_list = []
             for i, actor in enumerate(self.actors):
-                neighs = [curr_feats[j] for j in range(cfg.N_UAV) if j != i]
-                n_feats = torch.stack(neighs, dim=1) if neighs else None
-
-                mu, sigma, _ = actor(torch.FloatTensor(obs_list[i]).view(1, -1).to(self.device), n_feats)
-                dist = torch.distributions.Normal(mu, sigma)
-
+                mu, log_std = actor(all_feats[i:i + 1], neigh_feats_batch[i:i + 1])
                 if noise:
-                    act = dist.sample()
+                    sigma = torch.exp(log_std)
+                    u = mu + sigma * torch.randn_like(mu)
+                    act = torch.tanh(u)
                 else:
                     act = torch.tanh(mu)
+                actions_list.append(act)
 
-                actions.append(torch.tanh(act).cpu().numpy()[0])
-                feats_cpu.append(curr_feats[i].cpu().numpy().flatten())
+            action_tensor = torch.cat(actions_list, dim=0)
+            actions = action_tensor.cpu().numpy()
+            feats_cpu = all_feats.cpu().numpy()
 
         dummy = np.zeros((cfg.N_UAV, 1), dtype=np.float32)
-        return np.array(actions), np.array(feats_cpu), dummy, np.array(feats_cpu), dummy
+        return actions, feats_cpu, dummy, feats_cpu, dummy
 
-    def update(self):
+    def update(self, transition):
+        self.memory.push(*transition)
         if len(self.memory) < cfg.BATCH_SIZE: return
 
         utd = cfg.UPDATES_PER_STEP
@@ -153,14 +226,11 @@ class ST_MASAC_Agent:
             a_flat = a.view(cfg.BATCH_SIZE, -1)
             ns_flat = ns.view(cfg.BATCH_SIZE, -1)
 
-            # --- Critic ---
             with torch.no_grad():
                 alpha = self.log_alpha.exp()
                 next_feats = []
                 for i in range(cfg.N_UAV):
-                    x = F.relu(self.actors[i].fc1(ns[:, i, :]))
-                    f = F.relu(self.actors[i].feature_map(x))
-                    next_feats.append(f)
+                    next_feats.append(self.actors[i].extract_feat(ns[:, i, :]))
                 next_feats_stack = torch.stack(next_feats, dim=1)
 
                 next_acts_list = []
@@ -168,7 +238,8 @@ class ST_MASAC_Agent:
                 for i in range(cfg.N_UAV):
                     neigh_indices = [j for j in range(cfg.N_UAV) if j != i]
                     n_feats = next_feats_stack[:, neigh_indices, :]
-                    mu, sigma, _ = self.actors[i](ns[:, i, :], n_feats)
+                    mu, log_std = self.actors[i](next_feats[i], n_feats)
+                    sigma = torch.exp(log_std)
                     dist = torch.distributions.Normal(mu, sigma)
                     u = dist.sample()
                     next_act = torch.tanh(u)
@@ -177,28 +248,25 @@ class ST_MASAC_Agent:
 
                 next_global_act = torch.cat(next_acts_list, dim=1)
                 log_prob_next_sum = torch.cat(log_probs_next, dim=1).sum(dim=1, keepdim=True)
-
                 target_q_min = torch.min(self.target_c1(ns_flat, next_global_act),
                                          self.target_c2(ns_flat, next_global_act))
                 target_q = r + cfg.GAMMA * (1 - d) * (target_q_min - alpha * log_prob_next_sum)
 
             current_q1 = self.critic1(s_flat, a_flat)
             current_q2 = self.critic2(s_flat, a_flat)
-            loss_c = (weights * (F.smooth_l1_loss(current_q1, target_q, reduction='none') +
-                                 F.smooth_l1_loss(current_q2, target_q, reduction='none'))).mean()
+            loss_c = (weights * (F.smooth_l1_loss(current_q1, target_q, reduction='none') + F.smooth_l1_loss(current_q2,
+                                                                                                             target_q,
+                                                                                                             reduction='none'))).mean()
 
             self.critic_opt.zero_grad()
             loss_c.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 5.0)
-            torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 5.0)
+            torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), cfg.CLIP_GRAD)
+            torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), cfg.CLIP_GRAD)
             self.critic_opt.step()
 
-            # --- Actor ---
             curr_feats = []
             for i in range(cfg.N_UAV):
-                x = F.relu(self.actors[i].fc1(s[:, i, :]))
-                f = F.relu(self.actors[i].feature_map(x))
-                curr_feats.append(f)
+                curr_feats.append(self.actors[i].extract_feat(s[:, i, :]))
             curr_feats_stack = torch.stack(curr_feats, dim=1)
 
             curr_acts_list = []
@@ -206,7 +274,8 @@ class ST_MASAC_Agent:
             for i in range(cfg.N_UAV):
                 neigh_indices = [j for j in range(cfg.N_UAV) if j != i]
                 n_feats = curr_feats_stack[:, neigh_indices, :]
-                mu, sigma, _ = self.actors[i](s[:, i, :], n_feats)
+                mu, log_std = self.actors[i](curr_feats[i], n_feats)
+                sigma = torch.exp(log_std)
                 dist = torch.distributions.Normal(mu, sigma)
                 u = dist.rsample()
                 act = torch.tanh(u)
@@ -215,7 +284,6 @@ class ST_MASAC_Agent:
 
             curr_global_act = torch.cat(curr_acts_list, dim=1)
             log_prob_curr_sum = torch.cat(log_probs_curr, dim=1).sum(dim=1, keepdim=True)
-
             q_val = torch.min(self.critic1(s_flat, curr_global_act), self.critic2(s_flat, curr_global_act))
 
             alpha_detached = self.log_alpha.exp().detach()
@@ -223,16 +291,14 @@ class ST_MASAC_Agent:
 
             for opt in self.actor_opts: opt.zero_grad()
             loss_a.backward()
-            for a in self.actors: torch.nn.utils.clip_grad_norm_(a.parameters(), 5.0)
+            for a in self.actors: torch.nn.utils.clip_grad_norm_(a.parameters(), cfg.CLIP_GRAD)
             for opt in self.actor_opts: opt.step()
 
-            # --- Alpha ---
             loss_alpha = -(weights * self.log_alpha.exp() * (log_prob_curr_sum + self.target_entropy).detach()).mean()
             self.alpha_opt.zero_grad()
             loss_alpha.backward()
             self.alpha_opt.step()
 
-            # --- Target ---
             for p, tp in zip(self.critic1.parameters(), self.target_c1.parameters()):
                 tp.data.copy_(tp.data * (1 - cfg.TAU) + p.data * cfg.TAU)
             for p, tp in zip(self.critic2.parameters(), self.target_c2.parameters()):
@@ -241,481 +307,243 @@ class ST_MASAC_Agent:
             td_errors = (torch.abs(current_q1 - target_q) + torch.abs(current_q2 - target_q)) / 2.0
             self.memory.update_priorities(idxs, td_errors.detach().cpu().numpy().flatten())
 
-    def update_lr(self):
-        """
-        [职责修正] 仅负责更新学习率，不包含任何状态检查逻辑。
-        调用时机由外部 (main.py) 控制。
-        """
-        for sch in self.actor_schedulers:
-            sch.step()
-        self.critic_scheduler.step()
-        self.alpha_scheduler.step()
 
-    # --- 完整的 Checkpoint 保存与加载 (Fixed) ---
-    def save_ckpt(self, path, episode):
-        # 必须保存所有组件的状态字典
-        checkpoint = {
-            'episode': episode,
-            'actors': [a.state_dict() for a in self.actors],
-            'critic1': self.critic1.state_dict(),
-            'critic2': self.critic2.state_dict(),
-            'target_c1': self.target_c1.state_dict(),
-            'target_c2': self.target_c2.state_dict(),
-            'log_alpha': self.log_alpha,
-            'actor_opts': [opt.state_dict() for opt in self.actor_opts],
-            'critic_opt': self.critic_opt.state_dict(),
-            'alpha_opt': self.alpha_opt.state_dict(),
-            'actor_schs': [s.state_dict() for s in self.actor_schedulers],
-            'critic_sch': self.critic_scheduler.state_dict(),
-            'alpha_sch': self.alpha_scheduler.state_dict()
-        }
-        # 使用 safe_save 防止写坏文件
-        name = f"checkpoint_ep_{episode}.pth"
-        file_path = os.path.join(path, name)
-        torch.save(checkpoint, file_path)
-
-        # 清理旧 Checkpoint (保留最近5个)
-        files = sorted(glob.glob(os.path.join(path, "checkpoint_ep_*.pth")), key=os.path.getmtime)
-        if len(files) > 5:
-            try:
-                os.remove(files[0])
-            except:
-                pass
-
-    def load_ckpt(self, path):
-        # 寻找最新的 checkpoint
-        files = sorted(glob.glob(os.path.join(path, "checkpoint_ep_*.pth")), key=os.path.getmtime)
-        if not files:
-            return 0
-        latest = files[-1]
-        print(f">> Loading checkpoint: {latest}")
-
-        try:
-            ckpt = torch.load(latest, map_location=self.device)
-
-            # 恢复网络
-            for i, a in enumerate(self.actors): a.load_state_dict(ckpt['actors'][i])
-            self.critic1.load_state_dict(ckpt['critic1'])
-            self.critic2.load_state_dict(ckpt['critic2'])
-            self.target_c1.load_state_dict(ckpt['target_c1'])
-            self.target_c2.load_state_dict(ckpt['target_c2'])
-            with torch.no_grad():
-                self.log_alpha.copy_(ckpt['log_alpha'])
-
-            # 恢复优化器和调度器 (加 Try-Except 保证鲁棒性)
-            try:
-                for i, opt in enumerate(self.actor_opts): opt.load_state_dict(ckpt['actor_opts'][i])
-                self.critic_opt.load_state_dict(ckpt['critic_opt'])
-                self.alpha_opt.load_state_dict(ckpt['alpha_opt'])
-                for i, sch in enumerate(self.actor_schedulers): sch.load_state_dict(ckpt['actor_schs'][i])
-                self.critic_scheduler.load_state_dict(ckpt['critic_sch'])
-                self.alpha_scheduler.load_state_dict(ckpt['alpha_sch'])
-            except Exception as e:
-                print(f"Warning: Optimizer/Scheduler state load failed ({e}), continuing with fresh opts.")
-
-            return ckpt['episode'] + 1
-        except Exception as e:
-            print(f"Error loading checkpoint file: {e}")
-            return 0
-
-    # 兼容旧接口
-    def save(self, path):
-        self.save_ckpt(path, 999999)
-
-    def load(self, path):
-        return self.load_ckpt(path) > 0
-
-
-# ==========================================
-# 2. DDPG (Baseline - 无 Stack, 完整 Save/Load)
-# ==========================================
-class DDPG_Agent:
+# ================= DDPG =================
+class DDPG_Agent(BaseAgent):
     def __init__(self):
-        self.device = cfg.DEVICE
-        # [Baseline 使用 RAW_OBS_DIM = 8]
+        super().__init__()
+        # Baseline 使用原始单帧维度
         obs_dim = cfg.RAW_OBS_DIM
-
         self.actors = [BaselineActor(obs_dim, cfg.ACT_DIM).to(self.device) for _ in range(cfg.N_UAV)]
         self.targets = [BaselineActor(obs_dim, cfg.ACT_DIM).to(self.device) for _ in range(cfg.N_UAV)]
         for i in range(cfg.N_UAV): self.targets[i].load_state_dict(self.actors[i].state_dict())
-
         self.critics = [Critic(obs_dim, cfg.ACT_DIM).to(self.device) for _ in range(cfg.N_UAV)]
         self.target_cs = [Critic(obs_dim, cfg.ACT_DIM).to(self.device) for _ in range(cfg.N_UAV)]
         for i in range(cfg.N_UAV): self.target_cs[i].load_state_dict(self.critics[i].state_dict())
-
         self.actor_opts = [torch.optim.Adam(a.parameters(), lr=cfg.LR_ACTOR) for a in self.actors]
         self.critic_opts = [torch.optim.Adam(c.parameters(), lr=cfg.LR_CRITIC) for c in self.critics]
         self.memory = PrioritizedReplayBuffer(50000)
+        self.model_dict = {'actors': self.actors, 'critics': self.critics}
 
     def select_action(self, obs_list, noise=False):
         actions = []
         for i, actor in enumerate(self.actors):
-            # 确保输入是 (1, 8)
             o = torch.FloatTensor(obs_list[i]).unsqueeze(0).to(self.device)
             a = actor(o).detach().cpu().numpy()[0]
             if noise:
-                noise_tensor=torch.randn(cfg.ACT_DIM)*0.1
-                a += noise_tensor.numpy()
+                a += np.random.normal(0, cfg.DDPG_NOISE_STD, size=cfg.ACT_DIM)
             actions.append(np.clip(a, -1, 1))
         dummy = np.zeros((cfg.N_UAV, 1), dtype=np.float32)
         return np.array(actions), dummy, dummy, dummy, dummy
 
-    def update(self):
+    def update(self, transition):
+        self.memory.push(*transition)
         if len(self.memory) < cfg.BATCH_SIZE: return
+
         batch, _, _ = self.memory.sample(cfg.BATCH_SIZE)
         states, actions, rewards, next_states, dones, _, _, _, _ = batch
-
         for i in range(cfg.N_UAV):
             s = torch.FloatTensor(states[:, i, :]).to(self.device)
             a = torch.FloatTensor(actions[:, i, :]).to(self.device)
             r = torch.FloatTensor(rewards[:, i]).unsqueeze(1).to(self.device) * cfg.REWARD_SCALE
             ns = torch.FloatTensor(next_states[:, i, :]).to(self.device)
             d = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
-
             with torch.no_grad():
                 na = self.targets[i](ns)
                 q_target = r + cfg.GAMMA * (1 - d) * self.target_cs[i](ns, na)
-
             q_pred = self.critics[i](s, a)
             loss_c = F.mse_loss(q_pred, q_target)
-
             self.critic_opts[i].zero_grad()
             loss_c.backward()
             self.critic_opts[i].step()
-
             pred_a = self.actors[i](s)
             loss_a = -self.critics[i](s, pred_a).mean()
-
             self.actor_opts[i].zero_grad()
             loss_a.backward()
             self.actor_opts[i].step()
-
             for p, tp in zip(self.critics[i].parameters(), self.target_cs[i].parameters()):
-                tp.data.copy_(tp.data * (1-cfg.TAU) + p.data * cfg.TAU)
+                tp.data.copy_(tp.data * (1 - cfg.TAU) + p.data * cfg.TAU)
             for p, tp in zip(self.actors[i].parameters(), self.targets[i].parameters()):
-                tp.data.copy_(tp.data * (1-cfg.TAU) + p.data * cfg.TAU)
-
-    # --- 完整的 Save/Load 实现 (Fixed) ---
-    def save_ckpt(self, path, episode):
-        # DDPG 也需要保存优化器状态，防止中断后动量丢失
-        checkpoint = {
-            'episode': episode,
-            'actors': [a.state_dict() for a in self.actors],
-            'targets': [t.state_dict() for t in self.targets],
-            'critics': [c.state_dict() for c in self.critics],
-            'target_cs': [tc.state_dict() for tc in self.target_cs],
-            'actor_opts': [opt.state_dict() for opt in self.actor_opts],
-            'critic_opts': [opt.state_dict() for opt in self.critic_opts]
-        }
-        torch.save(checkpoint, os.path.join(path, f"checkpoint_ep_{episode}.pth"))
-        files = sorted(glob.glob(os.path.join(path, "checkpoint_ep_*.pth")), key=os.path.getmtime)
-        if len(files) > 5:
-            try:
-                os.remove(files[0])
-            except:
-                pass
-
-    def load_ckpt(self, path):
-        files = sorted(glob.glob(os.path.join(path, "checkpoint_ep_*.pth")), key=os.path.getmtime)
-        if not files: return 0
-        print(f">> Loading DDPG checkpoint: {files[-1]}")
-        try:
-            ckpt = torch.load(files[-1], map_location=self.device)
-            for i in range(cfg.N_UAV):
-                self.actors[i].load_state_dict(ckpt['actors'][i])
-                self.targets[i].load_state_dict(ckpt['targets'][i])
-                self.critics[i].load_state_dict(ckpt['critics'][i])
-                self.target_cs[i].load_state_dict(ckpt['target_cs'][i])
-                self.actor_opts[i].load_state_dict(ckpt['actor_opts'][i])
-                self.critic_opts[i].load_state_dict(ckpt['critic_opts'][i])
-            return ckpt['episode'] + 1
-        except Exception as e:
-            print(f"Error loading DDPG: {e}")
-            return 0
-
-    def save(self, path):
-        self.save_ckpt(path, 999999)
-
-    def load(self, path):
-        return self.load_ckpt(path) > 0
+                tp.data.copy_(tp.data * (1 - cfg.TAU) + p.data * cfg.TAU)
 
 
-# ==========================================
-# 3. Double DQN (Baseline - 无 Stack, 完整 Save/Load)
-# ==========================================
-class DoubleDQN_Agent:
+# ================= Double DQN =================
+class DoubleDQN_Agent(BaseAgent):
     def __init__(self):
-        self.device = cfg.DEVICE
+        super().__init__()
         self.disc = ActionDiscretizer()
-        self.n_actions = self.disc.n_actions
-        # [Baseline 使用 RAW_OBS_DIM = 8]
+        # Baseline 使用原始单帧维度
         obs_dim = cfg.RAW_OBS_DIM
-
-        self.q_nets = [DQN_Net(obs_dim, self.n_actions).to(self.device) for _ in range(cfg.N_UAV)]
-        self.target_nets = [DQN_Net(obs_dim, self.n_actions).to(self.device) for _ in range(cfg.N_UAV)]
-        # 初始化目标网络权重
-        for i in range(cfg.N_UAV):
-            self.target_nets[i].load_state_dict(self.q_nets[i].state_dict())
-        # 为每个网络配置独立的优化器
+        self.q_nets = [DoubleDQN_Net(obs_dim, self.disc.n_actions).to(self.device) for _ in range(cfg.N_UAV)]
+        self.target_nets = [DoubleDQN_Net(obs_dim, self.disc.n_actions).to(self.device) for _ in range(cfg.N_UAV)]
+        for i in range(cfg.N_UAV): self.target_nets[i].load_state_dict(self.q_nets[i].state_dict())
         self.opts = [torch.optim.Adam(q.parameters(), lr=cfg.LR_CRITIC) for q in self.q_nets]
         self.memory = PrioritizedReplayBuffer(50000)
         self.epsilon = 1.0
+        self.model_dict = {'q_nets': self.q_nets}
 
     def select_action(self, obs_list, noise=False):
         actions = []
         for i, net in enumerate(self.q_nets):
-            # 探索策略（Epsilon-Greedy)
-            if noise and torch.rand(1).item() < self.epsilon:
-                idx = torch.randint(self.n_actions, (1,)).item()
+            if noise and np.random.rand() < self.epsilon:
+                idx = np.random.randint(self.disc.n_actions)
             else:
                 o = torch.FloatTensor(obs_list[i]).unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    q = net(o)
-                    idx = torch.argmax(q).item()# 选择Q值最大的动作
+                idx = torch.argmax(net(o)).item()
             actions.append(self.disc.idx_to_act(idx))
         dummy = np.zeros((cfg.N_UAV, 1), dtype=np.float32)
         return np.array(actions), dummy, dummy, dummy, dummy
 
-    def update(self):
+    def update(self, transition):
+        self.memory.push(*transition)
         if len(self.memory) < 1000: return
-        # 探索率衰减
         self.epsilon = max(0.05, self.epsilon * 0.9995)
         batch, _, _ = self.memory.sample(cfg.BATCH_SIZE)
         states, actions, rewards, next_states, dones, _, _, _, _ = batch
-        # 对每个UAV独立更新
         for i in range(cfg.N_UAV):
             s = torch.FloatTensor(states[:, i, :]).to(self.device)
-            # 动作索引转换（将连续动作映射回离散索引）
-            act_vectors = actions[:, i, :]
-            act_indices = [self.disc.act_to_idx(v) for v in act_vectors]
-            a = torch.LongTensor(act_indices).unsqueeze(1).to(self.device)
+            act_idx = [self.disc.act_to_idx(a) for a in actions[:, i, :]]
+            a = torch.LongTensor(act_idx).unsqueeze(1).to(self.device)
             r = torch.FloatTensor(rewards[:, i]).unsqueeze(1).to(self.device) * cfg.REWARD_SCALE
             ns = torch.FloatTensor(next_states[:, i, :]).to(self.device)
             d = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
-            # ----Double DQN 核心逻辑 ----
-            # 1. 动作选择：使用当前网络选择下一时刻最优动作argmax Q_local(s',a)
 
             with torch.no_grad():
-                q_next_local=self.q_nets[i](ns)
-                next_acts=q_next_local.argmax(dim=1,keepdim=True)
-                # 2.价值评估：使用目标网络计算该动作的价值Q_target(s',next_act)
-                q_next_target=self.target_nets[i](ns)
-                q_next_val=q_next_target.gather(1,next_acts)
-                # 3. 计算目标Q值：Q_target(s,a)=r+gamma*Q_target(s',next_act))
-                target = r + cfg.GAMMA * q_next_val * (1 - d)
-            # 4. 计算当前Q值：Q_local(s,a)
-            q_current = self.q_nets[i](s).gather(1, a)
-            # 5. 计算损失函数并更新：Loss=|Q_local(s,a)-Q_target(s,a)|
-            loss = F.smooth_l1_loss(q_current, target)
+                next_acts = self.q_nets[i](ns).argmax(dim=1, keepdim=True)
+                q_next = self.target_nets[i](ns).gather(1, next_acts)
+                target = r + cfg.GAMMA * q_next * (1 - d)
+
+            q_curr = self.q_nets[i](s).gather(1, a)
+            loss = F.smooth_l1_loss(q_curr, target)
             self.opts[i].zero_grad()
             loss.backward()
             self.opts[i].step()
-            # 6. 软更新目标网络参数
             for p, tp in zip(self.q_nets[i].parameters(), self.target_nets[i].parameters()):
-                tp.data.copy_(tp.data * (1-cfg.TAU) + p.data * cfg.TAU)
-
-    # ---  Save/Load 实现 (Fixed) ---
-    def save_ckpt(self, path, episode):
-        checkpoint = {
-            'episode': episode,
-            'epsilon': self.epsilon,
-            # 保存所有UAV的网络列表
-            'q_nets': [q.state_dict() for q in self.q_nets],
-            'target_nets': [t.state_dict() for t in self.target_nets],
-            'opts': [opt.state_dict() for opt in self.opts]
-        }
-        torch.save(checkpoint, os.path.join(path, f"checkpoint_ep_{episode}.pth"))
-        # 删除旧的checkpoint文件，清理旧文件逻辑
-        import glob
-        files = sorted(glob.glob(os.path.join(path, "checkpoint_ep_*.pth")), key=os.path.getmtime)
-        if len(files) > 5:
-            try:
-                os.remove(files[0])
-            except:
-                pass
-
-    def load_ckpt(self, path):
-        import glob
-        files = sorted(glob.glob(os.path.join(path, "checkpoint_ep_*.pth")), key=os.path.getmtime)
-        if not files: return 0
-        print(f">> Loading Double DQN checkpoint: {files[-1]}")
-        try:
-            ckpt = torch.load(files[-1], map_location=self.device)
-            self.epsilon = ckpt.get('epsilon', self.epsilon)
-            for i in range(cfg.N_UAV):
-                self.q_nets[i].load_state_dict(ckpt['q_nets'][i])
-                self.target_nets[i].load_state_dict(ckpt['target_nets'][i])
-                self.opts[i].load_state_dict(ckpt['opts'][i])
-            return ckpt['episode'] + 1
-        except Exception as e:
-            print(f"Error loading Double DQN: {e}")
-            return 0
-
-    def save(self, path):
-        self.save_ckpt(path, 999999)
-
-    def load(self, path):
-        return self.load_ckpt(path) > 0
+                tp.data.copy_(tp.data * (1 - cfg.TAU) + p.data * cfg.TAU)
 
 
-# ==========================================
-# 4. A2C, 5. Q-Learning, 6. Random (Baselines)
-# ==========================================
-class A2C_Agent:
+# ================= A2C =================
+class A2C_Agent(BaseAgent):
     def __init__(self):
-        self.device = cfg.DEVICE
+        super().__init__()
+        # Baseline 使用原始单帧维度
         obs_dim = cfg.RAW_OBS_DIM
-        # 使用GaussianActor分布
         self.actors = [GaussianActor(obs_dim, cfg.ACT_DIM).to(self.device) for _ in range(cfg.N_UAV)]
         self.critics = [ValueNetwork(obs_dim).to(self.device) for _ in range(cfg.N_UAV)]
         self.actor_opts = [torch.optim.Adam(a.parameters(), lr=cfg.LR_ACTOR) for a in self.actors]
         self.critic_opts = [torch.optim.Adam(c.parameters(), lr=cfg.LR_CRITIC) for c in self.critics]
-        # 从配置读取，不使用硬编码，且不与SAC的alpha混淆
-        self.entropy_coef = cfg.ENTROPY_COEF_A2C#  Entropy 损失系数，熵正则化系数
-        self.clip_grad=cfg.CLIP_GRAD
+        self.entropy_coef = cfg.ENTROPY_COEF_A2C
+        self.clip_grad = cfg.CLIP_GRAD
+        self.model_dict = {'actors': self.actors, 'critics': self.critics}
+
     def select_action(self, obs_list, noise=False):
         actions = []
         for i, actor in enumerate(self.actors):
             o = torch.FloatTensor(obs_list[i]).unsqueeze(0).to(self.device)
-            # 获取分布参数
-            mu,sigma = actor(o)
+            mu, sigma = actor(o)
             dist = torch.distributions.Normal(mu, sigma)
-            if noise: # 训练模式：从分布采样
-                action = dist.sample()
-            else:
-                action = mu
-            # 截断到合法区间[-1,1]
-            action=torch.clamp(action,-1.0,1.0)
-            actions.append(action.detach().cpu().numpy()[0])
+            action = dist.sample() if noise else mu
+            actions.append(torch.clamp(action, -1.0, 1.0).detach().cpu().numpy()[0])
         dummy = np.zeros((cfg.N_UAV, 1), dtype=np.float32)
         return np.array(actions), dummy, dummy, dummy, dummy
 
-    def update_step(self, s_list, a_list, r_list, ns_list, done):
-        """
-        A2C 单步更新 (One-step TD)
-        虽然 A2C 通常用 N-step，但在这种实时环境中，单步更新也是标准的 Baseline 写法。
-        """
+    def update(self, transition):
+        # On-Policy: 直接从 transition 中解包数据
+        # transition: (states, actions, rewards, next_states, done, ...)
+        s, a, r, ns, d = transition[0], transition[1], transition[2], transition[3], transition[4]
+
         for i in range(cfg.N_UAV):
-            s = torch.FloatTensor(s_list[i]).unsqueeze(0).to(self.device)
-            a = torch.FloatTensor(a_list[i]).unsqueeze(0).to(self.device)
-            r = torch.FloatTensor([r_list[i]]).unsqueeze(1).to(self.device) * cfg.REWARD_SCALE
-            ns = torch.FloatTensor(ns_list[i]).unsqueeze(0).to(self.device)
-            d_val = done[i] if isinstance(done, (list, np.ndarray)) else done
-            # 1. 计算TD Target和Advantage
+            s_t = torch.FloatTensor(s[i]).unsqueeze(0).to(self.device)
+            a_t = torch.FloatTensor(a[i]).unsqueeze(0).to(self.device)
+            r_t = torch.FloatTensor([r[i]]).unsqueeze(1).to(self.device) * cfg.REWARD_SCALE
+            ns_t = torch.FloatTensor(ns[i]).unsqueeze(0).to(self.device)
+            d_val = d[i] if isinstance(d, (list, np.ndarray)) else d
+
             with torch.no_grad():
-                v_next = self.critics[i](ns)
-                td_target = r + cfg.GAMMA * (1 - int(d_val)) * v_next
-            v_curr = self.critics[i](s)
-            advantage = td_target - v_curr # TD Error也就是Advantage的无偏估计
-            # 2. Update Critic(MSE Loss)
+                td_target = r_t + cfg.GAMMA * (1 - int(d_val)) * self.critics[i](ns_t)
+
+            v_curr = self.critics[i](s_t)
+            advantage = td_target - v_curr
             critic_loss = F.mse_loss(v_curr, td_target)
             self.critic_opts[i].zero_grad()
             critic_loss.backward()
             self.critic_opts[i].step()
-            # 3. Update Actor(Policy Gradient with Advantage)
-            # 重新计算当前动作的log_prob（需要梯度）
-            mu,sigma = self.actors[i](s)
-            dist = torch.distributions.Normal(mu, sigma)
-            # 计算当前动作的log_prob
-            log_prob = dist.log_prob(a).sum(dim=-1,keepdim=True)
-            entropy = dist.entropy().sum(dim=-1,keepdim=True)
 
-            # Policy Gradient Loss = - (log_prob * advantage) - (entropy_coef * entropy)
-            # advantage.detach() 很重要，我们不把梯度传回 Critic
+            mu, sigma = self.actors[i](s_t)
+            dist = torch.distributions.Normal(mu, sigma)
+            log_prob = dist.log_prob(a_t).sum(dim=-1, keepdim=True)
+            entropy = dist.entropy().sum(dim=-1, keepdim=True)
             actor_loss = -(log_prob * advantage.detach() + self.entropy_coef * entropy).mean()
+
             self.actor_opts[i].zero_grad()
             actor_loss.backward()
-
-            # 梯度裁剪防止爆炸
             torch.nn.utils.clip_grad_norm_(self.actors[i].parameters(), self.clip_grad)
             self.actor_opts[i].step()
 
-    def save(self, path):
-        for i, a in enumerate(self.actors):
-            torch.save(a.state_dict(), os.path.join(path, f"a2c_actor_{i}.pth"))
-        for i, c in enumerate(self.critics):
-            torch.save(c.state_dict(), os.path.join(path, f"a2c_critic_{i}.pth"))
 
-    def load(self, path):
-        if not os.path.exists(os.path.join(path, "a2c_actor_0.pth")): return False
-        try:
-            for i, a in enumerate(self.actors):
-                a.load_state_dict(torch.load(os.path.join(path, f"a2c_actor_{i}.pth"), map_location=self.device))
-                self.critics[i].load_state_dict(
-                    torch.load(os.path.join(path, f"a2c_critic_{i}.pth"), map_location=self.device))
-            return True
-        except:
-            return False
-
-
-class QLearning_Agent:
+# ================= Q-Learning =================
+class QLearning_Agent(BaseAgent):
     def __init__(self):
+        super().__init__()
         self.disc = ActionDiscretizer()
         self.q_table = {}
         self.alpha = cfg.LR_TABULAR
         self.gamma = 0.9
         self.epsilon = 1.0
 
-    def _get_state_key(self, obs):
-        x = int(obs[0] * 10)
-        y = int(obs[1] * 10)
-        load = int(obs[7] * 5)
-        urg = int(obs[6] * 3)
-        return (x, y, load, urg)
+    def _get_key(self, obs):
+        return (int(obs[0] * 10), int(obs[1] * 10), int(obs[7] * 5))
 
     def select_action(self, obs_list, noise=False):
         actions = []
         for i, obs in enumerate(obs_list):
-            key = (i, self._get_state_key(obs))
+            key = (i, self._get_key(obs))
             if key not in self.q_table: self.q_table[key] = np.zeros(self.disc.n_actions)
-            if noise and torch.rand(1).item() < self.epsilon:
-                idx = torch.randint(self.disc.n_actions, (1,)).item()
+            if noise and np.random.rand() < self.epsilon:
+                idx = np.random.randint(self.disc.n_actions)
             else:
                 idx = np.argmax(self.q_table[key])
             actions.append(self.disc.idx_to_act(idx))
         dummy = np.zeros((cfg.N_UAV, 1), dtype=np.float32)
         return np.array(actions), dummy, dummy, dummy, dummy
 
-    def update_step(self, s_list, a_list, r_list, ns_list, done):
+    def update(self, transition):
         self.epsilon = max(0.05, self.epsilon * 0.9999)
+        s, a, r, ns, d = transition[0], transition[1], transition[2], transition[3], transition[4]
+
         for i in range(cfg.N_UAV):
-            key = (i, self._get_state_key(s_list[i]))
-            n_key = (i, self._get_state_key(ns_list[i]))
-            act_idx = self.disc.act_to_idx(a_list[i])
+            key = (i, self._get_key(s[i]))
+            n_key = (i, self._get_key(ns[i]))
+            idx = self.disc.act_to_idx(a[i])
             if n_key not in self.q_table: self.q_table[n_key] = np.zeros(self.disc.n_actions)
             if key not in self.q_table: self.q_table[key] = np.zeros(self.disc.n_actions)
-            d_val = done[i] if isinstance(done, (list, np.ndarray)) else done
+            d_val = d[i] if isinstance(d, (list, np.ndarray)) else d
+
             best_next_q = np.max(self.q_table[n_key])
-            target = r_list[i] + self.gamma * (1 - int(d_val)) * best_next_q
-            self.q_table[key][act_idx] += self.alpha * (target - self.q_table[key][act_idx])
+            target = r[i] + self.gamma * (1 - int(d_val)) * best_next_q
+            self.q_table[key][idx] += self.alpha * (target - self.q_table[key][idx])
 
-    def save(self, path):
-        try:
-            with open(os.path.join(path, "q_table.pkl"), "wb") as f:
-                pickle.dump(self.q_table, f)
-        except:
-            pass
+    # 覆盖 BaseAgent 的 save/load，因为是 pickle 格式
+    def save_ckpt(self, path, episode):
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "q_table.pkl"), "wb") as f:
+            pickle.dump({'q_table': self.q_table, 'episode': episode}, f)
 
-    def load(self, path):
-        try:
+    def load_ckpt(self, path, csv_path=None):
+        if os.path.exists(os.path.join(path, "q_table.pkl")):
             with open(os.path.join(path, "q_table.pkl"), "rb") as f:
-                self.q_table = pickle.load(f)
-            return True
-        except:
-            return False
+                data = pickle.load(f)
+                self.q_table = data['q_table']
+                return data['episode'] + 1
+        return 0
 
 
-class Random_Agent:
-    def __init__(self): self.device = cfg.DEVICE
+# ================= Random =================
+class Random_Agent(BaseAgent):
+    def __init__(self): super().__init__()
 
     def select_action(self, obs_list, noise=False):
-        rand_tensor = torch.rand(cfg.N_UAV, cfg.ACT_DIM)*2-1
-        actions=rand_tensor.numpy()
-        dummy = np.zeros((cfg.N_UAV, 1), dtype=np.float32)
-        return actions, dummy, dummy, dummy, dummy
+        return np.random.uniform(-1, 1, (cfg.N_UAV, cfg.ACT_DIM)), np.zeros((4, 1)), np.zeros((4, 1)), np.zeros(
+            (4, 1)), np.zeros((4, 1))
 
-    def update(self, *args, **kwargs): pass
-
-    def save(self, path): pass
-
-    def load(self, path): return True
+    def update(self, transition): pass

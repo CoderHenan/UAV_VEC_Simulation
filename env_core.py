@@ -4,227 +4,220 @@ from config import cfg
 
 
 class UAVEnv:
-    def __init__(self):
+    def __init__(self, seed=None):
         self.n_uav = cfg.N_UAV
         self.n_veh = cfg.N_VEHICLE
         self.map_size = cfg.MAP_SIZE
-        self.obs_dim = cfg.OBS_DIM
-        self.act_dim = cfg.ACT_DIM
+        self.time_step = 0
+
+        self.veh_tasks = {
+            'data': np.zeros(self.n_veh),
+            'cycles': np.zeros(self.n_veh),
+            't_max': np.zeros(self.n_veh),
+            'time_spent': np.zeros(self.n_veh),
+            'active': np.zeros(self.n_veh, dtype=bool),
+            'energy_consumed': np.zeros(self.n_veh)
+        }
         self.reset()
 
     def reset(self):
-        self.uav_pos = np.random.uniform(0.2, 0.8, (self.n_uav, 2)) * self.map_size
+        uav_rand = np.random.rand(self.n_uav, 2)
+        self.uav_pos = (uav_rand * 0.6 + 0.2) * self.map_size
         self.uav_vel = np.zeros((self.n_uav, 2))
 
-        # 车辆随机位置
-        self.veh_pos = np.random.uniform(0, 1, (self.n_veh, 2)) * self.map_size
+        veh_rand = np.random.rand(self.n_veh, 2)
+        self.veh_pos = veh_rand * self.map_size
 
-        # 车辆运动初始化 (Sim2Real: 惯性运动)
-        speeds = np.random.uniform(5, 15, self.n_veh)
-        angles = np.random.uniform(0, 2 * np.pi, self.n_veh)
+        speeds = np.random.rand(self.n_veh) * 10 + 5
+        angles = np.random.rand(self.n_veh) * 2 * np.pi
         self.veh_vel = np.stack([speeds * np.cos(angles), speeds * np.sin(angles)], axis=1)
 
-        self.tasks = self._generate_tasks()
+        self.veh_tasks['active'][:] = False
+        self._refresh_tasks(force_all=True)
+
         self.time_step = 0
         return self._get_obs(), self._get_global_state()
 
-    def _generate_tasks(self):
-        # 向量化生成任务
-        data = np.random.uniform(cfg.DATA_MIN, cfg.DATA_MAX, self.n_veh)
-        cycles = data * cfg.COMP_DENSITY
-        t_max = np.random.uniform(0.5, cfg.T_MAX, self.n_veh)
-        return {'data': data, 'cycles': cycles, 't_max': t_max}
+    def _refresh_tasks(self, force_all=False):
+        if force_all:
+            idx_to_gen = np.arange(self.n_veh)
+        else:
+            idx_to_gen = np.where(~self.veh_tasks['active'])[0]
+
+        count = len(idx_to_gen)
+        if count == 0: return
+
+        data = np.random.rand(count) * (cfg.DATA_MAX - cfg.DATA_MIN) + cfg.DATA_MIN
+        t_max = np.random.rand(count) * (cfg.T_MAX - 0.5) + 0.5
+
+        self.veh_tasks['data'][idx_to_gen] = data
+        self.veh_tasks['cycles'][idx_to_gen] = data * cfg.COMP_DENSITY
+        self.veh_tasks['t_max'][idx_to_gen] = t_max
+        self.veh_tasks['time_spent'][idx_to_gen] = 0.0
+        self.veh_tasks['energy_consumed'][idx_to_gen] = 0.0
+        self.veh_tasks['active'][idx_to_gen] = True
 
     def step(self, actions):
-        # --- 1. 物理运动 (向量化) ---
-        # Action mapping
         v_cmd = (actions[:, 0] + 1) / 2 * cfg.V_MAX
         theta_cmd = actions[:, 1] * np.pi
-        omega_thresh = (actions[:, 2] + 1) / 2  # Shape: (N_UAV,)
+        omega_thresh = (actions[:, 2] + 1) / 2
 
-        # UAV 更新
         vx = v_cmd * np.cos(theta_cmd)
         vy = v_cmd * np.sin(theta_cmd)
         self.uav_vel = np.stack([vx, vy], axis=1)
         self.uav_pos += self.uav_vel * cfg.TIME_SLOT
         self.uav_pos = np.clip(self.uav_pos, 0, self.map_size)
 
-        # Vehicle 更新 (边界反弹)
         self.veh_pos += self.veh_vel * cfg.TIME_SLOT
-        hit_x = (self.veh_pos[:, 0] < 0) | (self.veh_pos[:, 0] > self.map_size)
-        self.veh_vel[hit_x, 0] *= -1
-        hit_y = (self.veh_pos[:, 1] < 0) | (self.veh_pos[:, 1] > self.map_size)
-        self.veh_vel[hit_y, 1] *= -1
+        for i in range(2):
+            hit = (self.veh_pos[:, i] < 0) | (self.veh_pos[:, i] > self.map_size)
+            self.veh_vel[hit, i] *= -1
         self.veh_pos = np.clip(self.veh_pos, 0, self.map_size)
 
-        # --- 2. 通信模型 (全矩阵运算) ---
-        # 计算距离矩阵 (N_UAV, N_VEH)
-        # uav_pos: (N, 1, 2), veh_pos: (1, K, 2) -> Broadcasting
         dist_xy = np.linalg.norm(self.uav_pos[:, None, :] - self.veh_pos[None, :, :], axis=2)
         dist_3d = np.sqrt(dist_xy ** 2 + cfg.H_UAV ** 2)
-
-        # LoS 概率计算
         theta_deg = np.arctan(cfg.H_UAV / (dist_xy + 1e-6)) * 180 / np.pi
         p_los = 1 / (1 + cfg.PARAM_A * np.exp(-cfg.PARAM_B * (theta_deg - cfg.PARAM_A)))
-
-        # 路径损耗与信道增益
         pl_db = p_los * (20 * np.log10(dist_3d) + 20 * np.log10(cfg.FC) - 147.55 + cfg.ETA_LOS) + \
                 (1 - p_los) * (20 * np.log10(dist_3d) + 20 * np.log10(cfg.FC) - 147.55 + cfg.ETA_NLOS)
-        g_channel = 10 ** (-pl_db / 10)  # Shape: (N_UAV, N_VEH)
+        g_channel = 10 ** (-pl_db / 10)
 
-        # 用户关联 (最大接收功率)
-        assoc_uav = np.argmax(g_channel, axis=0)  # Shape: (N_VEH,)，每个车连接哪个UAV
-
-        # 计算信号与干扰
-        # 信号功率矩阵 S[u, k]
+        assoc_uav = np.argmax(g_channel, axis=0)
         sig_matrix = cfg.P_TX_VEHICLE * g_channel
-
-        # 提取每个车辆对自己关联UAV的信号功率
-        # sig_vec[k] = sig_matrix[assoc_uav[k], k]
         range_veh = np.arange(self.n_veh)
         signal_power = sig_matrix[assoc_uav, range_veh]
-
-        # 计算每个UAV受到的总干扰
-        # 干扰定义：UAV u 收到的所有功率 - 关联到 u 的车辆的功率 (OFDMA正交，小区内无干扰)
-        # 1. 统计每个UAV的总接收功率
-        total_power_at_uav = np.sum(sig_matrix, axis=1)  # (N_UAV,)
-
-        # 2. 统计每个UAV接收到的“有用”功率 (来自关联用户)
-        # 创建关联掩码 mask[u, k] = 1 if assoc_uav[k] == u
         assoc_mask = np.zeros((self.n_uav, self.n_veh))
         assoc_mask[assoc_uav, range_veh] = 1
-        useful_power_at_uav = np.sum(sig_matrix * assoc_mask, axis=1)  # (N_UAV,)
-
-        # 3. 干扰 = 总 - 有用
-        interference_at_uav = total_power_at_uav - useful_power_at_uav  # (N_UAV,)
-
-        # 映射回每个车辆：车辆 k 受到的干扰取决于它连的 assoc_uav[k]
-        inter_for_veh = interference_at_uav[assoc_uav]
-
-        # 计算 SINR 和 速率
+        total_power = np.sum(sig_matrix, axis=1)
+        useful_power = np.sum(sig_matrix * assoc_mask, axis=1)
+        inter_for_veh = (total_power - useful_power)[assoc_uav]
         sinr = signal_power / (cfg.NOISE_POWER + inter_for_veh + 1e-12)
+        uav_user_counts = np.maximum(np.sum(assoc_mask, axis=1), 1)
+        bw_per_user = cfg.BANDWIDTH / uav_user_counts[assoc_uav]
+        rates = bw_per_user * np.log2(1 + sinr)
 
-        # 动态带宽分配: 统计每个UAV服务的用户数
-        uav_user_counts = np.sum(assoc_mask, axis=1)  # (N_UAV,)
-        # 避免除以0
-        uav_user_counts = np.maximum(uav_user_counts, 1)
-        bw_per_user = cfg.BANDWIDTH / uav_user_counts[assoc_uav]  # 映射回车辆
+        active_mask = self.veh_tasks['active']
+        curr_data = self.veh_tasks['data']
+        curr_cycles = self.veh_tasks['cycles']
 
-        rates = bw_per_user * np.log2(1 + sinr)  # (N_VEH,)
+        t_loc = curr_cycles / (cfg.F_LOC + 1e-6)
+        t_trans = curr_data / (rates + 1e-6)
+        t_proc_uav = curr_cycles / (cfg.F_UAV + 1e-6)
+        t_offload = t_trans + t_proc_uav
 
-        # --- 3. 任务处理与奖励 (完全向量化) ---
-        rewards = np.zeros(self.n_uav)
-
-        # 基础飞行能耗惩罚
-        e_fly = (cfg.P_HOVER + cfg.KAPPA_FLY * np.sum(self.uav_vel ** 2, axis=1)) * cfg.TIME_SLOT
-        rewards -= cfg.W_ENERGY * e_fly  # (N_UAV,)
-
-        # 任务计算逻辑
-        d_k = self.tasks['data']
-        c_k = self.tasks['cycles']
-        t_max_k = self.tasks['t_max']
-
-        # 计算各项时间
-        t_loc = c_k / cfg.F_LOC
-        t_trans = d_k / (rates + 1e-6)
-        t_proc = c_k / cfg.F_UAV
-        t_offload = t_trans + t_proc
-
-        # 紧迫度
-        urgency = np.minimum(1.0, t_trans / t_max_k)
-
-        # 准入控制掩码
-        # 获取每个车辆对应的 UAV 阈值
+        rem_time = self.veh_tasks['t_max'] - self.veh_tasks['time_spent']
+        urgency = np.minimum(1.0, t_offload / (rem_time + 1e-6))
         veh_thresholds = omega_thresh[assoc_uav]
-
-        # 决策逻辑:
-        # Condition 1: Urgency > Threshold (UAV 愿意接)
-        # Condition 2: t_offload < t_loc (卸载比本地快)
         should_offload = (urgency > veh_thresholds) & (t_offload < t_loc)
 
-        # 最终执行时间与能耗
-        t_exe = np.where(should_offload, t_offload, t_loc)
+        processed_data = np.zeros(self.n_veh)
+        energy_step = np.zeros(self.n_veh)
 
-        e_comp_uav = cfg.KAPPA_COMP * (cfg.F_UAV ** 3) * t_proc
-        e_trans_veh = cfg.P_TX_VEHICLE * t_trans
+        loc_idx = (~should_offload) & active_mask
+        processed_data[loc_idx] = (cfg.F_LOC / cfg.COMP_DENSITY) * cfg.TIME_SLOT
 
-        # 只有 offload 才有额外的 UAV 能耗和传输能耗
-        e_k = np.where(should_offload, e_comp_uav + e_trans_veh, 0.0)
+        off_idx = should_offload & active_mask
+        processed_data[off_idx] = rates[off_idx] * cfg.TIME_SLOT
+        e_trans = cfg.P_TX_VEHICLE * cfg.TIME_SLOT
+        proc_bits = processed_data[off_idx]
+        t_comp_uav = (proc_bits * cfg.COMP_DENSITY) / cfg.F_UAV
+        e_comp_uav = cfg.KAPPA_COMP * (cfg.F_UAV ** 3) * t_comp_uav
+        energy_step[off_idx] = e_trans + e_comp_uav
 
-        # --- 奖励计算 ---
-        # 成功奖励: (t_exe <= t_max) -> +5.0
-        is_succ = t_exe <= t_max_k
-        r_vec = np.zeros(self.n_veh)
-        r_vec[is_succ] += cfg.R_TASK
+        self.veh_tasks['data'] -= processed_data
+        self.veh_tasks['time_spent'] += cfg.TIME_SLOT
+        self.veh_tasks['cycles'] = self.veh_tasks['data'] * cfg.COMP_DENSITY
+        self.veh_tasks['energy_consumed'] += energy_step
 
-        # 惩罚项
-        r_vec -= cfg.W_DELAY * (t_exe / cfg.T_MAX)
-        r_vec -= cfg.W_ENERGY * e_k
+        rewards = np.zeros(self.n_uav)
 
-        # 将车辆奖励累加回对应的 UAV
-        # 使用 np.add.at 进行原地累加 (相当于 scatter_add)
-        np.add.at(rewards, assoc_uav, r_vec)
+        is_completed = (self.veh_tasks['data'] <= 1e-6) & active_mask
+        is_timeout = (self.veh_tasks['data'] > 1e-6) & \
+                     (self.veh_tasks['time_spent'] > self.veh_tasks['t_max']) & \
+                     active_mask
 
-        # 统计数据
+        done_idx = np.where(is_completed | is_timeout)[0]
+
+        sum_r_base = 0
+        sum_p_fail = 0
+
+        for k in done_idx:
+            t_exe = self.veh_tasks['time_spent'][k]
+            t_max = self.veh_tasks['t_max'][k]
+            e_k = self.veh_tasks['energy_consumed'][k]
+
+            # [公式] Soft-Masked Reward
+            time_ratio = t_exe / t_max
+            term_exp = np.exp(-time_ratio)
+            term_lambda = 1 + cfg.REW_LAMBDA * (1 - time_ratio)
+            r_base = cfg.REW_W_T * term_exp * term_lambda - cfg.REW_W_E * e_k
+
+            tau = cfg.REW_TAU_RATIO * t_max
+            if t_exe <= t_max:
+                m = 1.0
+            else:
+                m = np.exp(-(t_exe - t_max) / tau)
+
+            r_final = m * r_base - (1 - m) * cfg.REW_P_FAIL
+
+            uav_id = assoc_uav[k]
+            rewards[uav_id] += r_final
+
+            if is_completed[k]: sum_r_base += r_final
+            if is_timeout[k]: sum_p_fail += r_final
+
+        e_fly = (cfg.P_HOVER + cfg.KAPPA_FLY * np.sum(self.uav_vel ** 2, axis=1)) * cfg.TIME_SLOT
+        rewards -= cfg.REW_W_E * e_fly
+
+        done_tasks = is_completed | is_timeout
+        self.veh_tasks['active'][done_tasks] = False
+
         ep_stats = {
-            'delay': np.mean(t_exe),
-            'energy': np.sum(e_fly) + np.sum(e_k),  # 包含飞行能耗
-            'succ': np.sum(is_succ)
+            'delay': np.mean(self.veh_tasks['time_spent'][is_completed]) if np.any(is_completed) else 0.0,
+            'energy': np.sum(e_fly) + np.sum(energy_step),
+            'succ_count': np.sum(is_completed),
+            'fail_count': np.sum(is_timeout),
+            'r_base_sum': sum_r_base,
+            'p_fail_sum': sum_p_fail,
+            'e_fly_penalty': np.sum(cfg.REW_W_E * e_fly)
         }
 
+        self._refresh_tasks()
         self.time_step += 1
         done = self.time_step >= cfg.MAX_STEPS
-        self.tasks = self._generate_tasks()  # 生成下一时刻任务
 
         return self._get_obs(), self._get_global_state(), rewards, done, ep_stats
 
     def _get_obs(self):
-        # 1. 物理特征 (N, 4)
         phy_norm = np.stack([
             self.uav_pos[:, 0] / cfg.MAP_SIZE, self.uav_pos[:, 1] / cfg.MAP_SIZE,
             self.uav_vel[:, 0] / cfg.V_MAX, self.uav_vel[:, 1] / cfg.V_MAX
         ], axis=1)
 
-        # 2. 感知计算 (全向量化)
-        # 距离掩码 (N, K)
         dists = np.linalg.norm(self.uav_pos[:, None, :] - self.veh_pos[None, :, :], axis=2)
-        mask = dists < 300  # Boolean (N, K)
+        mask = dists < 300
+        safe_div = np.maximum(np.sum(mask, axis=1, keepdims=True), 1.0)
 
-        # 避免除以0
-        num_nearby = np.sum(mask, axis=1, keepdims=True)  # (N, 1)
-        safe_div = np.maximum(num_nearby, 1.0)
+        curr_data = self.veh_tasks['data']
+        rem_time = self.veh_tasks['t_max'] - self.veh_tasks['time_spent']
+        rem_time = np.maximum(rem_time, 0.1)
 
-        # 车辆归一化位置 (K, 2)
-        veh_norm = self.veh_pos / cfg.MAP_SIZE
+        load_feat = np.sum(mask * curr_data[None, :], axis=1) / (10 * cfg.DATA_MAX)
 
-        # 利用矩阵乘法计算重心 (Sum(Pos * Mask) / Count)
-        # mask: (N, K), veh_norm: (K, 2) -> (N, 2)
-        # 扩展维度进行广播乘法: (N, K, 1) * (1, K, 2) -> Sum over K -> (N, 2)
-        masked_pos_sum = np.sum(mask[:, :, None] * veh_norm[None, :, :], axis=1)
-        centroids = masked_pos_sum / safe_div  # (N, 2) -> (cx, cy)
-
-        # 任务相关 (同样原理)
-        # tasks['data']: (K,)
-        masked_load = np.sum(mask * self.tasks['data'][None, :], axis=1)  # (N,)
-        load_feat = masked_load / (10 * cfg.DATA_MAX)
-
-        # 紧迫度 (简化估算，避免复杂信道重算)
-        # 这里为了速度，假设一个平均速率估算 Urgency
-        avg_rate = 5.0e6  # 5Mbps base
-        time_req = self.tasks['data'] / avg_rate
-        urg_raw = time_req / (self.tasks['t_max'] + 1e-6)
+        avg_rate = 5.0e6
+        urg_raw = (curr_data / avg_rate) / rem_time
+        urg_raw[~self.veh_tasks['active']] = 0
         masked_urg = np.sum(mask * urg_raw[None, :], axis=1) / safe_div.flatten()
 
-        # 3. 拼接
-        # centroids: (N, 2), masked_urg: (N,), load_feat: (N,)
+        veh_norm = self.veh_pos / cfg.MAP_SIZE
+        masked_pos_sum = np.sum(mask[:, :, None] * veh_norm[None, :, :], axis=1)
+        centroids = masked_pos_sum / safe_div
+
         sensing = np.stack([centroids[:, 0], centroids[:, 1], masked_urg, load_feat], axis=1)
-
-        # 如果没有邻居 (num_nearby == 0)，重心用自身位置代替，其他为0
-        no_neigh = (num_nearby.flatten() == 0)
+        no_neigh = (np.sum(mask, axis=1) == 0)
+        sensing[no_neigh, :] = 0
         sensing[no_neigh, 0:2] = phy_norm[no_neigh, 0:2]
-        sensing[no_neigh, 2:] = 0
 
-        # Final obs: (N, 8)
         return np.concatenate([phy_norm, sensing], axis=1)
 
     def _get_global_state(self):
