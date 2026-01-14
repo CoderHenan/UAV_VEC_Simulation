@@ -5,11 +5,13 @@ import torch.nn.functional as F
 import numpy as np
 from config import cfg
 
+
 def weights_init_(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
         if m.bias is not None:
             torch.nn.init.constant_(m.bias, 0)
+
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, input_dim, num_heads=cfg.ATTN_HEADS):
@@ -22,19 +24,35 @@ class MultiHeadAttention(nn.Module):
         self.W_V = nn.Linear(input_dim, input_dim)
         self.out_proj = nn.Linear(input_dim, input_dim)
 
-    def forward(self, query, values):
+    # [新增] mask 参数: 这里传入的是干扰矩阵 (Batch, N, N)
+    def forward(self, query, values, mask=None):
         batch_size = query.size(0)
         Q = self.W_Q(query).unsqueeze(1)
         K = self.W_K(values)
         V = self.W_V(values)
+
+        # (Batch, 1, Head, Dim)
         Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        # (Batch, N-1, Head, Dim)
         K = K.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Attention Scores (Batch, Head, 1, N-1)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.head_dim)
+
+        # [关键] 注入干扰矩阵
+        # mask 形状: (Batch, N, N-1) -> 需调整为 (Batch, 1, 1, N-1) 以广播
+        if mask is not None:
+            # 干扰越强，Score 越低 (减去 Penalty)
+            # mask 是 (Batch, N-1) 对应当前 Agent 的邻居干扰
+            mask = mask.unsqueeze(1).unsqueeze(2)
+            scores = scores - (mask * cfg.ATTN_INT_SCALE)
+
         attn_weights = F.softmax(scores, dim=-1)
         context = torch.matmul(attn_weights, V)
         context = context.transpose(1, 2).contiguous().view(batch_size, 1, -1)
-        return self.out_proj(context.squeeze(1))
+        return self.out_proj(context.squeeze(1)),attn_weights
+
 
 class ST_Actor(nn.Module):
     def __init__(self, obs_dim, act_dim):
@@ -51,9 +69,12 @@ class ST_Actor(nn.Module):
         my_feat = F.relu(self.feature_map(x))
         return my_feat
 
-    def forward(self, my_feat, neighbor_feats=None):
+    # [新增] inter_mask 参数
+    def forward(self, my_feat, neighbor_feats=None, inter_mask=None):
+        attn_weights=None
         if neighbor_feats is not None:
-            context = self.attn(my_feat, neighbor_feats)
+            # 传入干扰 Mask
+            context,attn_weights = self.attn(my_feat, neighbor_feats, mask=inter_mask)
             context = context.unsqueeze(1)
         else:
             context = torch.zeros_like(my_feat).unsqueeze(1)
@@ -62,8 +83,10 @@ class ST_Actor(nn.Module):
         mean = self.mean_layer(combined)
         log_std = self.log_std_layer(combined)
         log_std = torch.clamp(log_std, min=-20, max=1)
-        return mean, log_std
+        return mean, log_std,attn_weights
 
+
+# Critic 等其他类保持不变...
 class Critic(nn.Module):
     def __init__(self, global_obs_dim, global_act_dim):
         super(Critic, self).__init__()
@@ -78,6 +101,7 @@ class Critic(nn.Module):
         x = F.relu(self.l2(x))
         return self.l3(x)
 
+
 class BaselineActor(nn.Module):
     def __init__(self, obs_dim, act_dim):
         super(BaselineActor, self).__init__()
@@ -85,10 +109,12 @@ class BaselineActor(nn.Module):
         self.l2 = nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM_2)
         self.l3 = nn.Linear(cfg.HIDDEN_DIM_2, act_dim)
         self.apply(weights_init_)
+
     def forward(self, state):
         x = F.relu(self.l1(state))
         x = F.relu(self.l2(x))
         return torch.tanh(self.l3(x))
+
 
 class DoubleDQN_Net(nn.Module):
     def __init__(self, obs_dim, num_actions):
@@ -97,10 +123,12 @@ class DoubleDQN_Net(nn.Module):
         self.l2 = nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM_2)
         self.l3 = nn.Linear(cfg.HIDDEN_DIM_2, num_actions)
         self.apply(weights_init_)
+
     def forward(self, state):
         x = F.relu(self.l1(state))
         x = F.relu(self.l2(x))
         return self.l3(x)
+
 
 class ValueNetwork(nn.Module):
     def __init__(self, obs_dim):
@@ -109,10 +137,12 @@ class ValueNetwork(nn.Module):
         self.l2 = nn.Linear(cfg.HIDDEN_DIM, cfg.HIDDEN_DIM_2)
         self.v = nn.Linear(cfg.HIDDEN_DIM_2, 1)
         self.apply(weights_init_)
+
     def forward(self, state):
         x = F.relu(self.l1(state))
         x = F.relu(self.l2(x))
         return self.v(x)
+
 
 class GaussianActor(nn.Module):
     def __init__(self, obs_dim, act_dim):
@@ -122,6 +152,7 @@ class GaussianActor(nn.Module):
         self.mean_layer = nn.Linear(cfg.HIDDEN_DIM_2, act_dim)
         self.log_std_layer = nn.Linear(cfg.HIDDEN_DIM_2, act_dim)
         self.apply(weights_init_)
+
     def forward(self, state):
         x = F.relu(self.l1(state))
         x = F.relu(self.l2(x))

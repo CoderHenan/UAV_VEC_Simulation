@@ -55,10 +55,13 @@ class PrioritizedReplayBuffer:
         self.beta = beta
         self.epsilon = 1e-6
 
-    def push(self, state, action, reward, next_state, done, h_in, c_in, h_out, c_out):
+        # [新增] adj 参数: 干扰矩阵 (N_UAV, N_UAV)
+
+    def push(self, state, action, reward, next_state, done, adj, h_in, c_in, h_out, c_out):
         max_p = np.max(self.tree.tree[-self.tree.capacity:])
         if max_p == 0: max_p = 1.0
-        data = (state, action, reward, next_state, done, h_in, c_in, h_out, c_out)
+        # 将 adj 存入 tuple
+        data = (state, action, reward, next_state, done, adj, h_in, c_in, h_out, c_out)
         self.tree.add(max_p, data)
 
     def sample(self, batch_size):
@@ -67,7 +70,6 @@ class PrioritizedReplayBuffer:
         priorities = []
 
         segment = self.tree.total() / batch_size
-        # [严谨] 全局随机种子控制
         rand_vals = np.random.rand(batch_size)
 
         for i in range(batch_size):
@@ -83,11 +85,13 @@ class PrioritizedReplayBuffer:
 
         self.beta = min(1.0, self.beta + cfg.PER_BETA_INCREMENT)
 
-        states, actions, rewards, next_states, dones, h_in, c_in, h_out, c_out = zip(*batch_data)
+        # 解包 (新增 adj)
+        states, actions, rewards, next_states, dones, adj, h_in, c_in, h_out, c_out = zip(*batch_data)
 
         return (
             np.array(states), np.array(actions), np.array(rewards),
             np.array(next_states), np.array(dones),
+            np.array(adj),  # 返回干扰矩阵 Batch
             np.array(h_in), np.array(c_in), np.array(h_out), np.array(c_out)
         ), idxs, is_weights
 

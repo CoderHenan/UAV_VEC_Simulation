@@ -10,9 +10,11 @@ class UAVEnv:
         self.map_size = cfg.MAP_SIZE
         self.time_step = 0
 
+        # [修复] 任务状态严格区分
         self.veh_tasks = {
-            'data': np.zeros(self.n_veh),
-            'cycles': np.zeros(self.n_veh),
+            'init_data': np.zeros(self.n_veh),  # 任务初始总量 (不变)
+            'rem_data': np.zeros(self.n_veh),  # 剩余数据量 (变)
+            'cycles': np.zeros(self.n_veh),  # 剩余计算周期
             't_max': np.zeros(self.n_veh),
             'time_spent': np.zeros(self.n_veh),
             'active': np.zeros(self.n_veh, dtype=bool),
@@ -36,7 +38,9 @@ class UAVEnv:
         self._refresh_tasks(force_all=True)
 
         self.time_step = 0
-        return self._get_obs(), self._get_global_state()
+        # 返回 adj 矩阵
+        adj = self._get_interference_matrix()
+        return self._get_obs(), adj, self._get_global_state()
 
     def _refresh_tasks(self, force_all=False):
         if force_all:
@@ -50,17 +54,45 @@ class UAVEnv:
         data = np.random.rand(count) * (cfg.DATA_MAX - cfg.DATA_MIN) + cfg.DATA_MIN
         t_max = np.random.rand(count) * (cfg.T_MAX - 0.5) + 0.5
 
-        self.veh_tasks['data'][idx_to_gen] = data
+        # [修复] 初始化任务
+        self.veh_tasks['init_data'][idx_to_gen] = data
+        self.veh_tasks['rem_data'][idx_to_gen] = data  # 剩余 = 初始
         self.veh_tasks['cycles'][idx_to_gen] = data * cfg.COMP_DENSITY
         self.veh_tasks['t_max'][idx_to_gen] = t_max
         self.veh_tasks['time_spent'][idx_to_gen] = 0.0
         self.veh_tasks['energy_consumed'][idx_to_gen] = 0.0
         self.veh_tasks['active'][idx_to_gen] = True
 
+    def _get_interference_matrix(self):
+        """
+        计算 UAV 间的干扰矩阵 (归一化)
+        用于 Attention 的 Mask
+        I_ij = 距离相关的干扰强度
+        """
+        # 计算 UAV 两两间距离
+        diff = self.uav_pos[:, None, :] - self.uav_pos[None, :, :]
+        dists = np.linalg.norm(diff, axis=2) + 1e-6
+
+        # 简化的路损模型作为干扰强度 (Distance^-2)
+        # 距离越近，干扰越大
+        inter_matrix = 1.0 / (dists ** 2)
+
+        # 对角线置0 (自己不干扰自己)
+        np.fill_diagonal(inter_matrix, 0.0)
+
+        # 归一化 (0~1)
+        max_val = np.max(inter_matrix)
+        if max_val > 0:
+            inter_matrix /= max_val
+
+        return inter_matrix
+
     def step(self, actions):
+        # 1. 物理运动
         v_cmd = (actions[:, 0] + 1) / 2 * cfg.V_MAX
         theta_cmd = actions[:, 1] * np.pi
-        omega_thresh = (actions[:, 2] + 1) / 2
+        raw_thresh=actions[:,2]
+        omega_thresh = (raw_thresh + 1) / 2  # 准入阈值
 
         vx = v_cmd * np.cos(theta_cmd)
         vy = v_cmd * np.sin(theta_cmd)
@@ -74,6 +106,7 @@ class UAVEnv:
             self.veh_vel[hit, i] *= -1
         self.veh_pos = np.clip(self.veh_pos, 0, self.map_size)
 
+        # 2. 通信
         dist_xy = np.linalg.norm(self.uav_pos[:, None, :] - self.veh_pos[None, :, :], axis=2)
         dist_3d = np.sqrt(dist_xy ** 2 + cfg.H_UAV ** 2)
         theta_deg = np.arctan(cfg.H_UAV / (dist_xy + 1e-6)) * 180 / np.pi
@@ -96,8 +129,9 @@ class UAVEnv:
         bw_per_user = cfg.BANDWIDTH / uav_user_counts[assoc_uav]
         rates = bw_per_user * np.log2(1 + sinr)
 
+        # 3. 卸载决策
         active_mask = self.veh_tasks['active']
-        curr_data = self.veh_tasks['data']
+        curr_data = self.veh_tasks['rem_data']  # [修复] 使用剩余数据
         curr_cycles = self.veh_tasks['cycles']
 
         t_loc = curr_cycles / (cfg.F_LOC + 1e-6)
@@ -108,6 +142,8 @@ class UAVEnv:
         rem_time = self.veh_tasks['t_max'] - self.veh_tasks['time_spent']
         urgency = np.minimum(1.0, t_offload / (rem_time + 1e-6))
         veh_thresholds = omega_thresh[assoc_uav]
+
+        # [逻辑] 准入控制
         should_offload = (urgency > veh_thresholds) & (t_offload < t_loc)
 
         processed_data = np.zeros(self.n_veh)
@@ -124,29 +160,37 @@ class UAVEnv:
         e_comp_uav = cfg.KAPPA_COMP * (cfg.F_UAV ** 3) * t_comp_uav
         energy_step[off_idx] = e_trans + e_comp_uav
 
-        self.veh_tasks['data'] -= processed_data
+        # 更新状态
+        self.veh_tasks['rem_data'] -= processed_data  # [修复] 扣减剩余数据
+        self.veh_tasks['rem_data'] = np.maximum(self.veh_tasks['rem_data'], 0)  # 防止负数
         self.veh_tasks['time_spent'] += cfg.TIME_SLOT
-        self.veh_tasks['cycles'] = self.veh_tasks['data'] * cfg.COMP_DENSITY
+        self.veh_tasks['cycles'] = self.veh_tasks['rem_data'] * cfg.COMP_DENSITY
         self.veh_tasks['energy_consumed'] += energy_step
 
+        # --- 4. 奖励计算 ---
         rewards = np.zeros(self.n_uav)
 
-        is_completed = (self.veh_tasks['data'] <= 1e-6) & active_mask
-        is_timeout = (self.veh_tasks['data'] > 1e-6) & \
+        # [新增] 过程奖励: 只要有处理数据，就给分！
+        # 这让 Agent 即使没完成任务，也能根据处理量获得反馈
+        r_progress_step = processed_data * cfg.REW_W_PROG
+        # 累加到对应 UAV
+        np.add.at(rewards, assoc_uav, r_progress_step)
+
+        is_completed = (self.veh_tasks['rem_data'] <= 1e-6) & active_mask
+        is_timeout = (self.veh_tasks['rem_data'] > 1e-6) & \
                      (self.veh_tasks['time_spent'] > self.veh_tasks['t_max']) & \
                      active_mask
 
         done_idx = np.where(is_completed | is_timeout)[0]
 
-        sum_r_base = 0
-        sum_p_fail = 0
+        sum_r_outcome = 0
 
         for k in done_idx:
             t_exe = self.veh_tasks['time_spent'][k]
             t_max = self.veh_tasks['t_max'][k]
             e_k = self.veh_tasks['energy_consumed'][k]
 
-            # [公式] Soft-Masked Reward
+            # 结果奖励 R_outcome
             time_ratio = t_exe / t_max
             term_exp = np.exp(-time_ratio)
             term_lambda = 1 + cfg.REW_LAMBDA * (1 - time_ratio)
@@ -162,9 +206,7 @@ class UAVEnv:
 
             uav_id = assoc_uav[k]
             rewards[uav_id] += r_final
-
-            if is_completed[k]: sum_r_base += r_final
-            if is_timeout[k]: sum_p_fail += r_final
+            sum_r_outcome += r_final
 
         e_fly = (cfg.P_HOVER + cfg.KAPPA_FLY * np.sum(self.uav_vel ** 2, axis=1)) * cfg.TIME_SLOT
         rewards -= cfg.REW_W_E * e_fly
@@ -177,18 +219,21 @@ class UAVEnv:
             'energy': np.sum(e_fly) + np.sum(energy_step),
             'succ_count': np.sum(is_completed),
             'fail_count': np.sum(is_timeout),
-            'r_base_sum': sum_r_base,
-            'p_fail_sum': sum_p_fail,
-            'e_fly_penalty': np.sum(cfg.REW_W_E * e_fly)
+            'r_progress': np.sum(r_progress_step),  # 统计过程分
+            'r_outcome': sum_r_outcome
         }
 
         self._refresh_tasks()
         self.time_step += 1
         done = self.time_step >= cfg.MAX_STEPS
 
-        return self._get_obs(), self._get_global_state(), rewards, done, ep_stats
+        # 返回 adj 矩阵供 Attention 使用
+        adj = self._get_interference_matrix()
+
+        return self._get_obs(), adj, rewards, done, ep_stats
 
     def _get_obs(self):
+        # 保持不变
         phy_norm = np.stack([
             self.uav_pos[:, 0] / cfg.MAP_SIZE, self.uav_pos[:, 1] / cfg.MAP_SIZE,
             self.uav_vel[:, 0] / cfg.V_MAX, self.uav_vel[:, 1] / cfg.V_MAX
@@ -198,7 +243,7 @@ class UAVEnv:
         mask = dists < 300
         safe_div = np.maximum(np.sum(mask, axis=1, keepdims=True), 1.0)
 
-        curr_data = self.veh_tasks['data']
+        curr_data = self.veh_tasks['rem_data']  # [修复]
         rem_time = self.veh_tasks['t_max'] - self.veh_tasks['time_spent']
         rem_time = np.maximum(rem_time, 0.1)
 

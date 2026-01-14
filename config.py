@@ -5,7 +5,7 @@ import os
 
 class Config:
     # --- 实验标识 ---
-    EXP_NAME = 'Exp_Final_Paper_Version'
+    EXP_NAME = 'Exp_Final_Frozen_v1'
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
     RESULTS_ROOT = os.path.join(BASE_DIR, 'results', EXP_NAME)
@@ -18,19 +18,18 @@ class Config:
     H_UAV = 50.0
 
     # --- 状态维度 ---
-    # Baseline (DDPG/DQN) 使用此维度 (单帧)
+    # Baseline (DDPG/DQN) 使用此维度
     RAW_OBS_DIM = 8
-
-    # ST-C-MASAC 使用此维度 (多帧堆叠)
+    # ST-C-MASAC 使用堆叠帧 (3帧)
     N_FRAMES = 3
     OBS_DIM = RAW_OBS_DIM * N_FRAMES
-
     ACT_DIM = 3
 
     # --- 训练参数 ---
     MAX_EPISODES = 3000
     MAX_STEPS = 200
-    TIME_SLOT = 1.0
+    # [关键] 时间步长细化，让过程奖励更平滑
+    TIME_SLOT = 0.1
 
     CLIP_GRAD = 1.0
     LR_TABULAR = 0.1
@@ -38,17 +37,18 @@ class Config:
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    BATCH_SIZE = 512
+    BATCH_SIZE = 1024
     UPDATES_PER_STEP = 1
 
-    LR_ACTOR = 3e-4
-    LR_CRITIC = 1e-3
-    LR_DECAY_STEP = 800
+    LR_ACTOR = 1e-4
+    LR_CRITIC = 5e-4
+    LR_DECAY_STEP = 1000
     LR_DECAY_GAMMA = 0.9
 
     GAMMA = 0.99
     TAU = 0.005
-    REWARD_SCALE = 1.0
+    # 奖励缩放 (防止 Critic 数值爆炸)
+    REWARD_SCALE = 10.0
 
     ALPHA_START = 0.2
     DDPG_NOISE_STD = 0.2
@@ -56,6 +56,9 @@ class Config:
     HIDDEN_DIM = 512
     HIDDEN_DIM_2 = 256
     ATTN_HEADS = 4
+
+    # 干扰矩阵对 Attention 的惩罚力度
+    ATTN_INT_SCALE = 5.0
 
     PER_CAPACITY = 100000
     PER_ALPHA = 0.6
@@ -72,27 +75,31 @@ class Config:
     F_UAV = 2.5e9
     F_LOC = 1.0e9
 
-    # 任务参数 (适中难度)
-    DATA_MIN = 0.2e6
-    DATA_MAX = 1.0e6
+    # [难度设计] 适中难度，保证本地算不完，必须卸载
+    DATA_MIN = 2.0e6  # 2 Mbit
+    DATA_MAX = 5.0e6  # 5 Mbit
     COMP_DENSITY = 1000
-    T_MAX = 5.0
+    T_MAX = 5.0  # 5s
 
     V_MAX = 20.0
     P_HOVER, KAPPA_FLY, KAPPA_COMP = 80.0, 0.012, 1e-28
 
-    # --- 奖励函数 (Soft-Masked & 数值适配) ---
-    # R = m * R_base - (1-m) * P_fail
-    REW_W_T = 1.0
+    # --- 奖励函数 (Process + Result) ---
+    # R_total = R_progress + R_outcome - Costs
 
-    # [物理修正] 0.005 * 80J = 0.4分，与任务奖励(5.0)量级匹配
-    REW_W_E = 0.005
+    # 1. 过程奖励: 每传 1Mbit 给 10分
+    # 5Mbit 任务全部做完可得 50分，非常可观
+    REW_W_PROG = 10.0 / 1e6
+
+    # 2. 结果奖励 (额外的大红花)
+    REW_W_T = 20.0
+
+    # 3. 能耗惩罚 (平衡点)
+    # 0.1s 悬停耗 8J -> 罚 0.08分
+    REW_W_E = 0.01
 
     REW_LAMBDA = 0.8
-
-    # [初期容错] 降低失败惩罚，避免梯度消失
-    REW_P_FAIL = 0.5
-
+    REW_P_FAIL = 2.0  # 失败罚分增加，督促完成
     REW_TAU_RATIO = 0.1
 
 
