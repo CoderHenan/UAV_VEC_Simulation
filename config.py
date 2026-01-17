@@ -24,26 +24,28 @@ class Config:
     MAX_STEPS = 200
     TIME_SLOT = 0.1
 
-    CLIP_GRAD = 1.0
+    CLIP_GRAD = 0.5
     LR_TABULAR = 0.1
     ENTROPY_COEF_A2C = 0.01
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    BATCH_SIZE = 1024
+    BATCH_SIZE = 2048
     UPDATES_PER_STEP = 1
 
-    LR_ACTOR = 3e-4
+    LR_ACTOR = 1e-4
     LR_CRITIC = 1e-3
-    LR_DECAY_STEP = 1000
-    LR_DECAY_GAMMA = 0.9
+    LR_DECAY_STEP = 100
+    LR_DECAY_GAMMA = 0.95
 
     GAMMA = 0.99
-    TAU = 0.005
+    TAU = 0.1
     REWARD_SCALE = 0.01
 
     ALPHA_START = 0.2
-    DDPG_NOISE_STD = 0.2
+    DDPG_NOISE_STD = 0.3
+    NOISE_DECAY_RATE=0.999
+    MIN_NOISE=0.01
 
     HIDDEN_DIM = 512
     HIDDEN_DIM_2 = 256
@@ -82,7 +84,7 @@ class Config:
 
     REW_LAMBDA = 0.8
     REW_TAU_RATIO = 0.1
-    ATTN_INT_SCALE = 1.0
+    ATTN_INT_SCALE = 0.5
 
 
 cfg = Config()

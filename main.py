@@ -8,7 +8,9 @@ import random
 import traceback
 from config import cfg
 from env_core import UAVEnv
-from agent import ST_MASAC_Agent, DDPG_Agent, DoubleDQN_Agent, A2C_Agent, QLearning_Agent, Random_Agent, Greedy_Agent,ST_MADDPG_Agent
+from agent import (ST_MASAC_Agent, ST_MADDPG_Agent, DDPG_Agent,
+                   DoubleDQN_Agent, A2C_Agent, QLearning_Agent,
+                   Random_Agent, Greedy_Agent)
 
 
 def set_seed(seed):
@@ -38,18 +40,21 @@ def run_experiment(algo_name, seed):
 
     env = UAVEnv(seed=seed)
 
+    # 注册算法
     agents_map = {
-        "ST-C-MASAC": ST_MASAC_Agent,
-        "DDPG": DDPG_Agent,
-        "Double DQN": DoubleDQN_Agent,
-        "A2C": A2C_Agent,
-        "Q-Learning": QLearning_Agent,
-        "Random": Random_Agent,
-        "Greedy":Greedy_Agent,
-        "ST-C-MADDPG": ST_MADDPG_Agent
+        "ST-C-MADDPG": ST_MADDPG_Agent,  # [你的终极方案]
+        "ST-C-MASAC": ST_MASAC_Agent,  # (已弃用)
+        "DDPG": DDPG_Agent,  # Baseline 1
+        "Double DQN": DoubleDQN_Agent,  # Baseline 2
+        "A2C": A2C_Agent,  # Baseline 3
+        "Random": Random_Agent,  # Baseline 4
+        "Greedy": Greedy_Agent  # Baseline 5
     }
 
-    if algo_name not in agents_map: return
+    if algo_name not in agents_map:
+        print(f"Error: {algo_name} not found.")
+        return
+
     agent = agents_map[algo_name]()
 
     use_stack = hasattr(agent, 'reset_stack')
@@ -61,7 +66,6 @@ def run_experiment(algo_name, seed):
     if start_ep == 0 and os.path.exists(csv_path): os.remove(csv_path)
     if start_ep == 0:
         with open(csv_path, 'w') as f:
-            # 保持详细表头
             f.write("ep,reward,delay,energy,succ,fail,arrived,overflow,r_prog,r_out,alpha,attn_mean,attn_std\n")
 
     training_started = False
@@ -86,8 +90,8 @@ def run_experiment(algo_name, seed):
                 ret = agent.select_action(curr_state, adj, noise=True)
                 if len(ret) == 5:
                     action, attn_weights, h_in, h_out, c_out = ret
-                else:  # 兼容旧接口或其他 Agent
-                    action, h_in, h_out, c_out, _ = ret  # 假设无 attn_weights
+                else:
+                    action, h_in, h_out, c_out, _ = ret
                     attn_weights = None
 
                 if attn_weights is not None:
@@ -116,8 +120,6 @@ def run_experiment(algo_name, seed):
                 ep_fail += info['fail_count']
                 ep_arr += info['arrived_count']
                 ep_over += info['overflow_count']
-
-                # [关键] 显式累加两部分奖励
                 ep_r_prog += info['r_progress']
                 ep_r_out += info['r_outcome']
 
@@ -129,6 +131,7 @@ def run_experiment(algo_name, seed):
 
             avg_delay = ep_delay / max(1, steps)
             avg_energy = ep_energy / max(1, steps)
+            # DDPG 没有 alpha，显示 0
             curr_alpha = agent.log_alpha.exp().item() if hasattr(agent, 'log_alpha') else 0.0
 
             if last_attn_weights is not None:
@@ -143,10 +146,7 @@ def run_experiment(algo_name, seed):
                         f"{attn_mean:.4f},{attn_std:.4f}\n")
 
             if ep % 10 == 0:
-                fps = int(steps / (time.time() - st_time))
-
-                # [优化显示的 Print]
-                # 清晰展示: 总分 = 过程分 + 结果分
+                fps = int(steps / (time.time() - st_time + 1e-6))
                 print(f"Ep {ep:<4} | R_Tot:{ep_r:>7.1f} = [Prog:{ep_r_prog:>6.1f} + Out:{ep_r_out:>6.1f}] "
                       f"| S:{ep_succ:>3} F:{ep_fail:>3} (Ov:{ep_over:>2}) | FPS:{fps}")
 
@@ -166,7 +166,10 @@ def run_experiment(algo_name, seed):
 
 if __name__ == "__main__":
     SEEDS = [42]
-    ALGOS = ["ST-C-MASAC"]
+    # 先跑 Random 确认基准，再跑 ST-C-MADDPG
+    # ALGOS = ["Random", "ST-C-MADDPG"]
+    ALGOS = ["ST-C-MADDPG"]
+
     for seed in SEEDS:
         for algo in ALGOS:
             run_experiment(algo, seed)
