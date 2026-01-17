@@ -8,7 +8,7 @@ import random
 import traceback
 from config import cfg
 from env_core import UAVEnv
-from agent import ST_MASAC_Agent, DDPG_Agent, DoubleDQN_Agent, A2C_Agent, QLearning_Agent, Random_Agent
+from agent import ST_MASAC_Agent, DDPG_Agent, DoubleDQN_Agent, A2C_Agent, QLearning_Agent, Random_Agent, Greedy_Agent,ST_MADDPG_Agent
 
 
 def set_seed(seed):
@@ -44,7 +44,9 @@ def run_experiment(algo_name, seed):
         "Double DQN": DoubleDQN_Agent,
         "A2C": A2C_Agent,
         "Q-Learning": QLearning_Agent,
-        "Random": Random_Agent
+        "Random": Random_Agent,
+        "Greedy":Greedy_Agent,
+        "ST-C-MADDPG": ST_MADDPG_Agent
     }
 
     if algo_name not in agents_map: return
@@ -58,9 +60,9 @@ def run_experiment(algo_name, seed):
 
     if start_ep == 0 and os.path.exists(csv_path): os.remove(csv_path)
     if start_ep == 0:
-        # [修改] 表头增加 attn_mean, attn_std
         with open(csv_path, 'w') as f:
-            f.write("ep,reward,delay,energy,succ_rate,fail_rate,r_progress,r_outcome,alpha,attn_mean,attn_std\n")
+            # 保持详细表头
+            f.write("ep,reward,delay,energy,succ,fail,arrived,overflow,r_prog,r_out,alpha,attn_mean,attn_std\n")
 
     training_started = False
 
@@ -69,25 +71,29 @@ def run_experiment(algo_name, seed):
             st_time = time.time()
 
             raw_obs, adj, _ = env.reset()
-
             curr_state = agent.reset_stack(raw_obs) if use_stack else raw_obs
 
             ep_r, ep_delay, ep_energy = 0, 0, 0
             ep_succ, ep_fail = 0, 0
+            ep_arr, ep_over = 0, 0
             ep_r_prog, ep_r_out = 0, 0
 
             last_attn_weights = None
-
             steps = 0
 
             for step in range(cfg.MAX_STEPS):
-                action, attn_weights, h_in, h_out, c_out = agent.select_action(curr_state, adj, noise=True)
+                # 适配不同 Agent 的返回值
+                ret = agent.select_action(curr_state, adj, noise=True)
+                if len(ret) == 5:
+                    action, attn_weights, h_in, h_out, c_out = ret
+                else:  # 兼容旧接口或其他 Agent
+                    action, h_in, h_out, c_out, _ = ret  # 假设无 attn_weights
+                    attn_weights = None
 
                 if attn_weights is not None:
                     last_attn_weights = attn_weights
 
                 next_raw_obs, next_adj, rewards, done, info = env.step(action)
-
                 next_state = agent.stack_obs(next_raw_obs) if use_stack else next_raw_obs
 
                 transition = (curr_state, action, rewards, next_state, done, adj, h_in, h_out, h_out, c_out)
@@ -102,11 +108,16 @@ def run_experiment(algo_name, seed):
                 curr_state = next_state
                 adj = next_adj
 
+                # 统计累加
                 ep_r += np.sum(rewards)
                 ep_delay += info['delay']
                 ep_energy += info['energy']
                 ep_succ += info['succ_count']
                 ep_fail += info['fail_count']
+                ep_arr += info['arrived_count']
+                ep_over += info['overflow_count']
+
+                # [关键] 显式累加两部分奖励
                 ep_r_prog += info['r_progress']
                 ep_r_out += info['r_outcome']
 
@@ -120,28 +131,28 @@ def run_experiment(algo_name, seed):
             avg_energy = ep_energy / max(1, steps)
             curr_alpha = agent.log_alpha.exp().item() if hasattr(agent, 'log_alpha') else 0.0
 
-            # [修改] 计算 Attention 统计量
             if last_attn_weights is not None:
                 attn_mean = np.mean(last_attn_weights)
                 attn_std = np.std(last_attn_weights)
             else:
                 attn_mean, attn_std = 0.0, 0.0
 
-            # [修改] 写入 CSV
             with open(csv_path, 'a') as f:
                 f.write(f"{ep},{ep_r:.2f},{avg_delay:.3f},{avg_energy:.2f},{ep_succ},{ep_fail},"
-                        f"{ep_r_prog:.2f},{ep_r_out:.2f},{curr_alpha:.4f},"
+                        f"{ep_arr},{ep_over},{ep_r_prog:.2f},{ep_r_out:.2f},{curr_alpha:.4f},"
                         f"{attn_mean:.4f},{attn_std:.4f}\n")
 
             if ep % 10 == 0:
                 fps = int(steps / (time.time() - st_time))
-                print(f"Ep {ep:<4} | R: {ep_r:>7.1f} (Prog:{ep_r_prog:>5.0f} Out:{ep_r_out:>5.0f}) "
-                      f"| S: {ep_succ:>3} F: {ep_fail:>3} | AttnStd: {attn_std:.4f} | FPS: {fps}")
+
+                # [优化显示的 Print]
+                # 清晰展示: 总分 = 过程分 + 结果分
+                print(f"Ep {ep:<4} | R_Tot:{ep_r:>7.1f} = [Prog:{ep_r_prog:>6.1f} + Out:{ep_r_out:>6.1f}] "
+                      f"| S:{ep_succ:>3} F:{ep_fail:>3} (Ov:{ep_over:>2}) | FPS:{fps}")
 
             if ep % 500 == 0 and last_attn_weights is not None:
                 save_path = os.path.join(weights_dir, f"attn_ep_{ep}.npy")
                 np.save(save_path, last_attn_weights)
-                print(f"   💾 Saved Attention Weights to {save_path}")
 
             if ep % 50 == 0 and hasattr(agent, 'save_ckpt'):
                 agent.save_ckpt(model_dir, ep)
@@ -154,7 +165,7 @@ def run_experiment(algo_name, seed):
 
 
 if __name__ == "__main__":
-    SEEDS = [10, 20, 30]
+    SEEDS = [42]
     ALGOS = ["ST-C-MASAC"]
     for seed in SEEDS:
         for algo in ALGOS:

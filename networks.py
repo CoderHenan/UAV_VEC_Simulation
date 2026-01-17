@@ -24,7 +24,7 @@ class MultiHeadAttention(nn.Module):
         self.W_V = nn.Linear(input_dim, input_dim)
         self.out_proj = nn.Linear(input_dim, input_dim)
 
-    # [新增] mask 参数: 这里传入的是干扰矩阵 (Batch, N, N)
+    # mask 参数: 传入的是干扰矩阵 (Batch, N, N)
     def forward(self, query, values, mask=None):
         batch_size = query.size(0)
         Q = self.W_Q(query).unsqueeze(1)
@@ -40,18 +40,17 @@ class MultiHeadAttention(nn.Module):
         # Attention Scores (Batch, Head, 1, N-1)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.head_dim)
 
-        # [关键] 注入干扰矩阵
+        # 注入干扰矩阵
         # mask 形状: (Batch, N, N-1) -> 需调整为 (Batch, 1, 1, N-1) 以广播
         if mask is not None:
             # 干扰越强，Score 越低 (减去 Penalty)
-            # mask 是 (Batch, N-1) 对应当前 Agent 的邻居干扰
             mask = mask.unsqueeze(1).unsqueeze(2)
             scores = scores - (mask * cfg.ATTN_INT_SCALE)
 
         attn_weights = F.softmax(scores, dim=-1)
         context = torch.matmul(attn_weights, V)
         context = context.transpose(1, 2).contiguous().view(batch_size, 1, -1)
-        return self.out_proj(context.squeeze(1)),attn_weights
+        return self.out_proj(context.squeeze(1)), attn_weights
 
 
 class ST_Actor(nn.Module):
@@ -69,24 +68,25 @@ class ST_Actor(nn.Module):
         my_feat = F.relu(self.feature_map(x))
         return my_feat
 
-    # [新增] inter_mask 参数
     def forward(self, my_feat, neighbor_feats=None, inter_mask=None):
-        attn_weights=None
         if neighbor_feats is not None:
             # 传入干扰 Mask
-            context,attn_weights = self.attn(my_feat, neighbor_feats, mask=inter_mask)
+            context, attn_weights = self.attn(my_feat, neighbor_feats, mask=inter_mask)
             context = context.unsqueeze(1)
         else:
             context = torch.zeros_like(my_feat).unsqueeze(1)
+            attn_weights = None
 
         combined = torch.cat([my_feat.unsqueeze(1), context], dim=2).squeeze(1)
         mean = self.mean_layer(combined)
         log_std = self.log_std_layer(combined)
-        log_std = torch.clamp(log_std, min=-20, max=1)
-        return mean, log_std,attn_weights
+
+        # [关键修改] 限制 Log Std 最大值，避免探索动作过于随机
+        log_std = torch.clamp(log_std, min=-20, max=-1)
+
+        return mean, log_std, attn_weights
 
 
-# Critic 等其他类保持不变...
 class Critic(nn.Module):
     def __init__(self, global_obs_dim, global_act_dim):
         super(Critic, self).__init__()
@@ -158,5 +158,8 @@ class GaussianActor(nn.Module):
         x = F.relu(self.l2(x))
         mean = torch.tanh(self.mean_layer(x))
         log_std = self.log_std_layer(x)
-        log_std = torch.clamp(log_std, min=-20, max=1)
+
+        # [关键修改] 同步修改 A2C Actor 的 Log Std 限制
+        log_std = torch.clamp(log_std, min=-20, max=-1)
+
         return mean, log_std.exp()
