@@ -8,9 +8,14 @@ import random
 import traceback
 from config import cfg
 from env_core import UAVEnv
-from agent import (ST_MASAC_Agent, ST_MADDPG_Agent, DDPG_Agent,
+from agent import (ST_MADDPG_Agent, DDPG_Agent,
                    DoubleDQN_Agent, A2C_Agent, QLearning_Agent,
                    Random_Agent, Greedy_Agent)
+
+
+# ST-C-MASAC 已弃用，但为了防止导入报错保留占位
+class ST_MASAC_Agent:
+    def __init__(self): pass
 
 
 def set_seed(seed):
@@ -42,13 +47,12 @@ def run_experiment(algo_name, seed):
 
     # 注册算法
     agents_map = {
-        "ST-C-MADDPG": ST_MADDPG_Agent,  # [你的终极方案]
-        "ST-C-MASAC": ST_MASAC_Agent,  # (已弃用)
-        "DDPG": DDPG_Agent,  # Baseline 1
-        "Double DQN": DoubleDQN_Agent,  # Baseline 2
-        "A2C": A2C_Agent,  # Baseline 3
-        "Random": Random_Agent,  # Baseline 4
-        "Greedy": Greedy_Agent  # Baseline 5
+        "ST-C-MADDPG": ST_MADDPG_Agent,
+        "DDPG": DDPG_Agent,
+        "Double DQN": DoubleDQN_Agent,
+        "A2C": A2C_Agent,
+        "Random": Random_Agent,
+        "Greedy": Greedy_Agent
     }
 
     if algo_name not in agents_map:
@@ -66,6 +70,7 @@ def run_experiment(algo_name, seed):
     if start_ep == 0 and os.path.exists(csv_path): os.remove(csv_path)
     if start_ep == 0:
         with open(csv_path, 'w') as f:
+            # CSV 表头保持不变，与 env_core 输出对齐
             f.write("ep,reward,delay,energy,succ,fail,arrived,overflow,r_prog,r_out,alpha,attn_mean,attn_std\n")
 
     training_started = False
@@ -120,8 +125,10 @@ def run_experiment(algo_name, seed):
                 ep_fail += info['fail_count']
                 ep_arr += info['arrived_count']
                 ep_over += info['overflow_count']
-                ep_r_prog += info['r_progress']
-                ep_r_out += info['r_outcome']
+
+                # [关键修复] 使用 env_core.py 返回的正确键名 'r_prog' 和 'r_out'
+                ep_r_prog += info.get('r_prog', 0)
+                ep_r_out += info.get('r_out', 0)
 
                 steps += 1
                 if np.all(done): break
@@ -131,7 +138,6 @@ def run_experiment(algo_name, seed):
 
             avg_delay = ep_delay / max(1, steps)
             avg_energy = ep_energy / max(1, steps)
-            # DDPG 没有 alpha，显示 0
             curr_alpha = agent.log_alpha.exp().item() if hasattr(agent, 'log_alpha') else 0.0
 
             if last_attn_weights is not None:
@@ -147,8 +153,9 @@ def run_experiment(algo_name, seed):
 
             if ep % 10 == 0:
                 fps = int(steps / (time.time() - st_time + 1e-6))
-                print(f"Ep {ep:<4} | R_Tot:{ep_r:>7.1f} = [Prog:{ep_r_prog:>6.1f} + Out:{ep_r_out:>6.1f}] "
-                      f"| S:{ep_succ:>3} F:{ep_fail:>3} (Ov:{ep_over:>2}) | FPS:{fps}")
+                # 打印日志微调：新环境的 reward 是负数 (Cost)，所以显示 Cost 更直观
+                print(
+                    f"Ep {ep:<4} | R_Tot:{ep_r:>8.1f} (Cost) | Delay:{avg_delay:>5.2f} Eng:{avg_energy:>5.2f} | FPS:{fps}")
 
             if ep % 500 == 0 and last_attn_weights is not None:
                 save_path = os.path.join(weights_dir, f"attn_ep_{ep}.npy")
@@ -166,8 +173,6 @@ def run_experiment(algo_name, seed):
 
 if __name__ == "__main__":
     SEEDS = [42]
-    # 先跑 Random 确认基准，再跑 ST-C-MADDPG
-    # ALGOS = ["Random", "ST-C-MADDPG"]
     ALGOS = ["ST-C-MADDPG"]
 
     for seed in SEEDS:

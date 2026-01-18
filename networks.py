@@ -45,7 +45,7 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             # 干扰越强，Score 越低 (减去 Penalty)
             mask = mask.unsqueeze(1).unsqueeze(2)
-            scores = scores - (mask * cfg.ATTN_INT_SCALE)
+            scores = scores + (mask * cfg.ATTN_INT_SCALE)
 
         attn_weights = F.softmax(scores, dim=-1)
         context = torch.matmul(attn_weights, V)
